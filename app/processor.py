@@ -29,6 +29,7 @@ from gdb_reader import (
     load_vector_layer,
 )
 
+
 def ensure_raster_crs(raster_layer: QgsRasterLayer) -> QgsCoordinateReferenceSystem:
     """Возвращает CRS растра. Если CRS не определён — назначает WGS84 (EPSG:4326)."""
     crs = raster_layer.crs()
@@ -158,8 +159,14 @@ def count_intersections(vector_layer: QgsVectorLayer, buffer_geom: QgsGeometry) 
 
 
 def raster_intersects_buffer(raster_layer: QgsRasterLayer, buffer_geom: QgsGeometry, processing_crs) -> bool:
+    raster_crs = ensure_raster_crs(raster_layer)
     raster_geom = extent_to_geometry(raster_layer.extent())
-    raster_geom_proc = transform_geometry(raster_geom, raster_layer.crs(), processing_crs)
+    raster_geom_proc = transform_geometry(raster_geom, raster_crs, processing_crs)
+    print("[DEBUG] raster CRS:", raster_crs.authid())
+    print("[DEBUG] raster extent (orig):", raster_layer.extent().toString())
+    print("[DEBUG] raster extent (proc):", raster_geom_proc.boundingBox().toString())
+    print("[DEBUG] buffer bbox:", buffer_geom.boundingBox().toString())
+    print("[DEBUG] intersects:", raster_geom_proc.intersects(buffer_geom))
     return raster_geom_proc.intersects(buffer_geom)
 
 
@@ -181,10 +188,11 @@ def clip_raster_layer(
     output_path: str,
     processing_crs
 ):
+    raster_crs = ensure_raster_crs(raster_layer)
     params = {
         "INPUT": raster_layer.source(),
         "MASK": buffer_layer,
-        "SOURCE_CRS": raster_layer.crs(),
+        "SOURCE_CRS": raster_crs,
         "TARGET_CRS": processing_crs,
         "NODATA": None,
         "ALPHA_BAND": False,
