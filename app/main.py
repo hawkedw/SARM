@@ -35,7 +35,14 @@ from qgis.PyQt.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from qgis.core import QgsProject, QgsRasterLayer
+from qgis.core import (
+    QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
+    QgsProject,
+    QgsRasterLayer,
+    QgsReferencedRectangle,
+    QgsRectangle,
+)
 from qgis.gui import QgsLayerTreeMapCanvasBridge, QgsMapCanvas
 
 from gdb_reader import (
@@ -49,23 +56,13 @@ from processor import process_gdb
 
 
 BASEMAPS = [
-    {
-        "name": "— нет подложки —",
-        "url": None,
-    },
-    {
-        "name": "OSM",
-        "url": "type=xyz&url=https://tile.openstreetmap.org/{z}/{x}/{y}.png&zmax=19&zmin=0",
-    },
-    {
-        "name": "Esri Imagery",
-        "url": "type=xyz&url=https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}&zmax=19&zmin=0",
-    },
-    {
-        "name": "Esri Topo",
-        "url": "type=xyz&url=https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}&zmax=19&zmin=0",
-    },
+    {"name": "— нет подложки —", "url": None},
+    {"name": "OSM", "url": "type=xyz&url=https://tile.openstreetmap.org/{z}/{x}/{y}.png&zmax=19&zmin=0"},
+    {"name": "Esri Imagery", "url": "type=xyz&url=https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}&zmax=19&zmin=0"},
+    {"name": "Esri Topo", "url": "type=xyz&url=https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}&zmax=19&zmin=0"},
 ]
+
+CRS_3857 = QgsCoordinateReferenceSystem("EPSG:3857")
 
 
 class MainWindow(QMainWindow):
@@ -80,10 +77,17 @@ class MainWindow(QMainWindow):
 
         self.route_rows = []
         self.preview_layers = []
-        self._basemap_layer = None
+        self._basemap_layer_id = None
 
         self._build_ui()
         self._load_config_into_ui()
+
+        # Устанавливаем CRS проекта и канваса 3857
+        self.project.setCrs(CRS_3857)
+        self.canvas.setDestinationCrs(CRS_3857)
+
+        # По умолчанию включаем OSM (index=1)
+        self.basemap_combo.setCurrentIndex(1)
 
     def _build_ui(self):
         root = QWidget()
@@ -109,20 +113,17 @@ class MainWindow(QMainWindow):
         self.gdb_edit = QLineEdit()
         gdb_btn = QPushButton("...")
         gdb_btn.clicked.connect(self.choose_gdb)
-        gdb_row = self._with_button(self.gdb_edit, gdb_btn)
-        form.addRow("Input GDB", gdb_row)
+        form.addRow("Input GDB", self._with_button(self.gdb_edit, gdb_btn))
 
         self.output_edit = QLineEdit()
         out_btn = QPushButton("...")
         out_btn.clicked.connect(self.choose_output)
-        out_row = self._with_button(self.output_edit, out_btn)
-        form.addRow("Output folder", out_row)
+        form.addRow("Output folder", self._with_button(self.output_edit, out_btn))
 
         self.raster_edit = QLineEdit()
         raster_btn = QPushButton("...")
         raster_btn.clicked.connect(self.choose_raster_folder)
-        raster_row = self._with_button(self.raster_edit, raster_btn)
-        form.addRow("Raster folder", raster_row)
+        form.addRow("Raster folder", self._with_button(self.raster_edit, raster_btn))
 
         self.buffer_spin = QDoubleSpinBox()
         self.buffer_spin.setRange(1, 1000000)
@@ -135,7 +136,6 @@ class MainWindow(QMainWindow):
 
         self.load_btn = QPushButton("Load GDB")
         self.load_btn.clicked.connect(self.load_gdb)
-
         self.run_btn = QPushButton("Run")
         self.run_btn.clicked.connect(self.run_export)
 
@@ -177,10 +177,10 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.canvas)
 
     def _switch_basemap(self, index):
-        # Удаляем предыдущую подложку
-        if self._basemap_layer is not None:
-            self.project.removeMapLayer(self._basemap_layer.id())
-            self._basemap_layer = None
+        # Удаляем предыдущую подложку по id (не по объекту)
+        if self._basemap_layer_id is not None:
+            self.project.removeMapLayer(self._basemap_layer_id)
+            self._basemap_layer_id = None
 
         bm = BASEMAPS[index]
         if bm["url"] is None:
@@ -193,6 +193,8 @@ class MainWindow(QMainWindow):
             return
 
         self.project.addMapLayer(layer)
+        self._basemap_layer_id = layer.id()
+
         # Помещаем подложку в самый низ дерева слоёв
         root = self.project.layerTreeRoot()
         node = root.findLayer(layer.id())
@@ -201,7 +203,6 @@ class MainWindow(QMainWindow):
             root.removeChildNode(node)
             root.addChildNode(clone)
 
-        self._basemap_layer = layer
         self.canvas.refresh()
 
     def _with_button(self, line_edit, button):
@@ -244,14 +245,13 @@ class MainWindow(QMainWindow):
             self.raster_edit.setText(path)
 
     def clear_project(self):
-        bm_id = self._basemap_layer.id() if self._basemap_layer else None
         self.project.removeAllMapLayers()
+        self._basemap_layer_id = None
         self.preview_layers = []
         self.route_combo.clear()
         self.route_rows = []
         self.report_text.clear()
-        self._basemap_layer = None
-        # Восстанавливаем подложку после очистки
+        # Восстанавливаем подложку
         idx = self.basemap_combo.currentIndex()
         if idx > 0:
             self._switch_basemap(idx)
@@ -301,21 +301,22 @@ class MainWindow(QMainWindow):
             for row in self.route_rows:
                 self.route_combo.addItem(row["label"], row["fid"])
 
+            # Приближение к слою маршрутов в 3857
             if route_layer.isValid():
-                self.canvas.setExtent(route_layer.extent())
+                transform = QgsCoordinateTransform(
+                    route_layer.crs(), CRS_3857, self.project
+                )
+                extent_3857 = transform.transformBoundingBox(route_layer.extent())
+                extent_3857.grow(extent_3857.width() * 0.1)
+                self.canvas.setExtent(extent_3857)
                 self.canvas.refresh()
 
             self.info_label.setText(
                 "Загружено: vectors=%d, rasters=%d, routes=%d"
                 % (len(vector_layers), len(raster_layers), len(self.route_rows))
             )
-
             self.report_text.setPlainText(
-                "GDB loaded\n"
-                "Route layer: %s\n"
-                "Available routes: %d\n"
-                "Vector layers: %d\n"
-                "Raster layers: %d"
+                "GDB loaded\nRoute layer: %s\nAvailable routes: %d\nVector layers: %d\nRaster layers: %d"
                 % (route_layer_name, len(self.route_rows), len(vector_layers), len(raster_layers))
             )
 
@@ -351,14 +352,8 @@ class MainWindow(QMainWindow):
 
             manifest = result["manifest"]
             self.report_text.setPlainText(self.format_manifest(manifest))
-
             self.info_label.setText("Готово. ZIP: %s" % result["zip_path"])
-
-            QMessageBox.information(
-                self,
-                "Готово",
-                "Архив сформирован:\n%s" % result["zip_path"]
-            )
+            QMessageBox.information(self, "Готово", "Архив сформирован:\n%s" % result["zip_path"])
 
         except Exception as ex:
             self.show_error(ex)
@@ -373,7 +368,6 @@ class MainWindow(QMainWindow):
         lines.append("Summary:")
         for k, v in manifest["summary"].items():
             lines.append("  %s: %s" % (k, v))
-
         lines.append("")
         lines.append("Layers:")
         for item in manifest["layers"]:
@@ -382,14 +376,11 @@ class MainWindow(QMainWindow):
                 % (item["layer"], item["type"], item["status"],
                    item.get("input_count", "-"), item.get("output_count", "-"))
             )
-
         return "\n".join(lines)
 
     def show_error(self, ex: Exception):
         self.info_label.setText("Ошибка")
-        self.report_text.setPlainText(
-            "%s\n\n%s" % (ex, traceback.format_exc())
-        )
+        self.report_text.setPlainText("%s\n\n%s" % (ex, traceback.format_exc()))
         QMessageBox.critical(self, "Ошибка", str(ex))
 
 
