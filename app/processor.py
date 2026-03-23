@@ -360,6 +360,10 @@ def process_gdb(
 
                 try:
                     raster_layer = QgsRasterLayer(str(src_path), layer_name)
+                    print("[DEBUG] loading:", fname)
+                    print("[DEBUG] isValid:", raster_layer.isValid())
+                    print("[DEBUG] CRS:", raster_layer.crs().authid())
+                    print("[DEBUG] extent:", raster_layer.extent().toString())
                     if not raster_layer.isValid():
                         item["status"] = "error: invalid_raster"
                     elif not raster_intersects_buffer(raster_layer, buffer_geom, processing_crs):
