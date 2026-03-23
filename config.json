@@ -1,0 +1,11 @@
+{
+  "qgis_prefix_path": "E:/Distributive Soft/NextGIS",
+  "input_gdb_path": "F:/Work/SWARM/InputTopo.gdb",
+  "input_raster_folder": "F:/Work/Ukr/rasters",
+  "output_root": "F:/Work/SWARM/json",
+  "route_layer_name": "RouteLines",
+  "route_name_field": "name",
+  "default_buffer_m": 500.0,
+  "processing_crs_epsg": 3857,
+  "load_all_layers_to_map": true
+}
