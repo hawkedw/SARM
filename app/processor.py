@@ -29,6 +29,14 @@ from gdb_reader import (
     load_vector_layer,
 )
 
+def ensure_raster_crs(raster_layer: QgsRasterLayer) -> QgsCoordinateReferenceSystem:
+    """Возвращает CRS растра. Если CRS не определён — назначает WGS84 (EPSG:4326)."""
+    crs = raster_layer.crs()
+    if not crs.isValid():
+        crs = QgsCoordinateReferenceSystem.fromEpsgId(4326)
+        raster_layer.setCrs(crs)
+    return crs
+
 
 def transform_geometry(geometry: QgsGeometry, source_crs, target_crs) -> QgsGeometry:
     geom = QgsGeometry(geometry)
