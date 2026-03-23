@@ -17,9 +17,8 @@ from qgis_runtime import init_qgis, init_processing, shutdown_qgis
 QGS_APP = init_qgis(config["qgis_prefix_path"], gui_enabled=True)
 init_processing()
 
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import Qt, QTimer
 from qgis.PyQt.QtWidgets import (
-    QApplication,
     QComboBox,
     QFileDialog,
     QDoubleSpinBox,
@@ -40,8 +39,6 @@ from qgis.core import (
     QgsCoordinateTransform,
     QgsProject,
     QgsRasterLayer,
-    QgsReferencedRectangle,
-    QgsRectangle,
 )
 from qgis.gui import QgsLayerTreeMapCanvasBridge, QgsMapCanvas
 
@@ -57,9 +54,9 @@ from processor import process_gdb
 
 BASEMAPS = [
     {"name": "— нет подложки —", "url": None},
-    {"name": "OSM", "url": "type=xyz&url=https://tile.openstreetmap.org/{z}/{x}/{y}.png&zmax=19&zmin=0"},
-    {"name": "Esri Imagery", "url": "type=xyz&url=https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}&zmax=19&zmin=0"},
-    {"name": "Esri Topo", "url": "type=xyz&url=https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}&zmax=19&zmin=0"},
+    {"name": "OSM",          "url": "type=xyz&url=https://tile.openstreetmap.org/{z}/{x}/{y}.png&zmax=19&zmin=0&crs=EPSG:3857"},
+    {"name": "Esri Imagery", "url": "type=xyz&url=https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}&zmax=19&zmin=0&crs=EPSG:3857"},
+    {"name": "Esri Topo",    "url": "type=xyz&url=https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}&zmax=19&zmin=0&crs=EPSG:3857"},
 ]
 
 CRS_3857 = QgsCoordinateReferenceSystem("EPSG:3857")
@@ -71,6 +68,7 @@ class MainWindow(QMainWindow):
         self.config_path = config_path
         self.config = json.loads(config_path.read_text(encoding="utf-8"))
         self.project = QgsProject.instance()
+        self.project.setCrs(CRS_3857)
 
         self.setWindowTitle("Topo Cutter MVP")
         self.resize(1500, 900)
@@ -82,12 +80,10 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._load_config_into_ui()
 
-        # Устанавливаем CRS проекта и канваса 3857
-        self.project.setCrs(CRS_3857)
         self.canvas.setDestinationCrs(CRS_3857)
 
-        # По умолчанию включаем OSM (index=1)
-        self.basemap_combo.setCurrentIndex(1)
+        # Инициализация подложки после запуска event loop
+        QTimer.singleShot(200, lambda: self.basemap_combo.setCurrentIndex(1))
 
     def _build_ui(self):
         root = QWidget()
@@ -96,7 +92,6 @@ class MainWindow(QMainWindow):
         splitter = QSplitter()
         left = QWidget()
         right = QWidget()
-
         splitter.addWidget(left)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
@@ -177,7 +172,6 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.canvas)
 
     def _switch_basemap(self, index):
-        # Удаляем предыдущую подложку по id (не по объекту)
         if self._basemap_layer_id is not None:
             self.project.removeMapLayer(self._basemap_layer_id)
             self._basemap_layer_id = None
@@ -192,16 +186,14 @@ class MainWindow(QMainWindow):
             self.info_label.setText("Не удалось загрузить подложку: %s" % bm["name"])
             return
 
-        self.project.addMapLayer(layer)
+        # addMapLayer(layer, False) — не добавлять в дерево автоматически
+        self.project.addMapLayer(layer, False)
         self._basemap_layer_id = layer.id()
 
-        # Помещаем подложку в самый низ дерева слоёв
+        # Вставляем в самый низ дерева слоёв
         root = self.project.layerTreeRoot()
-        node = root.findLayer(layer.id())
-        if node:
-            clone = node.clone()
-            root.removeChildNode(node)
-            root.addChildNode(clone)
+        from qgis.core import QgsLayerTreeLayer
+        root.insertChildNode(-1, QgsLayerTreeLayer(layer))
 
         self.canvas.refresh()
 
@@ -251,7 +243,6 @@ class MainWindow(QMainWindow):
         self.route_combo.clear()
         self.route_rows = []
         self.report_text.clear()
-        # Восстанавливаем подложку
         idx = self.basemap_combo.currentIndex()
         if idx > 0:
             self._switch_basemap(idx)
@@ -288,7 +279,6 @@ class MainWindow(QMainWindow):
                         self.preview_layers.append(layer)
                     except Exception:
                         pass
-
                 for item in raster_layers:
                     try:
                         layer = load_raster_layer(item["source"], item["name"])
@@ -301,11 +291,8 @@ class MainWindow(QMainWindow):
             for row in self.route_rows:
                 self.route_combo.addItem(row["label"], row["fid"])
 
-            # Приближение к слою маршрутов в 3857
             if route_layer.isValid():
-                transform = QgsCoordinateTransform(
-                    route_layer.crs(), CRS_3857, self.project
-                )
+                transform = QgsCoordinateTransform(route_layer.crs(), CRS_3857, self.project)
                 extent_3857 = transform.transformBoundingBox(route_layer.extent())
                 extent_3857.grow(extent_3857.width() * 0.1)
                 self.canvas.setExtent(extent_3857)
