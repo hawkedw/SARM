@@ -161,12 +161,7 @@ def raster_intersects_buffer(raster_layer: QgsRasterLayer, buffer_geom: QgsGeome
     raster_crs = ensure_raster_crs(raster_layer)
     raster_geom = extent_to_geometry(raster_layer.extent())
     raster_geom_proc = transform_geometry(raster_geom, raster_crs, processing_crs)
-    print("  [R] CRS:", raster_crs.authid())
-    print("  [R] extent orig:", raster_layer.extent().toString())
-    print("  [R] extent proc:", raster_geom_proc.boundingBox().toString())
-    print("  [R] buffer bbox:", buffer_geom.boundingBox().toString())
     result = raster_geom_proc.intersects(buffer_geom)
-    print("  [R] intersects:", result)
     return result
 
 
@@ -189,11 +184,13 @@ def clip_raster_layer(
     processing_crs
 ):
     raster_crs = ensure_raster_crs(raster_layer)
+    # Репроецируем маску в CRS растра если они различаются
+    mask_layer = reproject_vector_if_needed(buffer_layer, raster_crs)
     params = {
         "INPUT": raster_layer.source(),
-        "MASK": buffer_layer,
+        "MASK": mask_layer,
         "SOURCE_CRS": raster_crs,
-        "TARGET_CRS": processing_crs,
+        "TARGET_CRS": raster_crs,
         "NODATA": None,
         "ALPHA_BAND": False,
         "CROP_TO_CUTLINE": True,
@@ -207,7 +204,8 @@ def clip_raster_layer(
         "EXTRA": "",
         "OUTPUT": output_path
     }
-    processing.run("gdal:cliprasterbymasklayer", params)
+    result = processing.run("gdal:cliprasterbymasklayer", params)
+    print("  [clip] output:", result.get("OUTPUT"))
 
 
 def process_gdb(
@@ -306,10 +304,8 @@ def process_gdb(
         manifest["layers"].append(item)
 
     # -------- РАСТРЫ ИЗ GDB (если есть) --------
-    print("[GDB rasters found]:", len(raster_layers_in_gdb))
     for raster_info in raster_layers_in_gdb:
         layer_name = raster_info["name"]
-        print("[GDB raster] name=%s source=%s" % (layer_name, raster_info["source"]))
         item = {
             "layer": layer_name,
             "type": "raster",
@@ -321,9 +317,6 @@ def process_gdb(
 
         try:
             raster_layer = load_raster_layer(raster_info["source"], layer_name)
-            print("  isValid:", raster_layer.isValid())
-            print("  CRS:", raster_layer.crs().authid())
-            print("  extent:", raster_layer.extent().toString())
 
             if not raster_intersects_buffer(raster_layer, buffer_geom, processing_crs):
                 item["status"] = "no_overlap"
@@ -340,25 +333,19 @@ def process_gdb(
 
         except Exception as ex:
             item["status"] = "error: %s" % ex
-            print("  ERROR:", ex)
 
         manifest["layers"].append(item)
 
     # -------- ВНЕШНИЕ TIFF ИЗ ПАПКИ --------
-    print("[ext raster folder]:", input_raster_folder)
     if input_raster_folder:
         raster_dir_in = Path(input_raster_folder)
-        print("[ext raster folder exists]:", raster_dir_in.exists())
         if raster_dir_in.exists():
-            all_files = os.listdir(str(raster_dir_in))
-            print("[ext raster files]:", all_files)
-            for fname in all_files:
+            for fname in os.listdir(str(raster_dir_in)):
                 if not fname.lower().endswith((".tif", ".tiff")):
                     continue
 
                 src_path = raster_dir_in / fname
                 layer_name = src_path.stem
-                print("[ext raster] loading:", fname, "as", layer_name)
 
                 item = {
                     "layer": layer_name,
@@ -371,9 +358,6 @@ def process_gdb(
 
                 try:
                     raster_layer = QgsRasterLayer(str(src_path), layer_name)
-                    print("  isValid:", raster_layer.isValid())
-                    print("  CRS:", raster_layer.crs().authid())
-                    print("  extent:", raster_layer.extent().toString())
                     if not raster_layer.isValid():
                         item["status"] = "error: invalid_raster"
                     elif not raster_intersects_buffer(raster_layer, buffer_geom, processing_crs):
