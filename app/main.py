@@ -35,7 +35,7 @@ from qgis.PyQt.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from qgis.core import QgsProject
+from qgis.core import QgsProject, QgsRasterLayer
 from qgis.gui import QgsLayerTreeMapCanvasBridge, QgsMapCanvas
 
 from gdb_reader import (
@@ -46,6 +46,26 @@ from gdb_reader import (
     load_vector_layer,
 )
 from processor import process_gdb
+
+
+BASEMAPS = [
+    {
+        "name": "— нет подложки —",
+        "url": None,
+    },
+    {
+        "name": "OSM",
+        "url": "type=xyz&url=https://tile.openstreetmap.org/{z}/{x}/{y}.png&zmax=19&zmin=0",
+    },
+    {
+        "name": "Esri Imagery",
+        "url": "type=xyz&url=https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}&zmax=19&zmin=0",
+    },
+    {
+        "name": "Esri Topo",
+        "url": "type=xyz&url=https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}&zmax=19&zmin=0",
+    },
+]
 
 
 class MainWindow(QMainWindow):
@@ -60,6 +80,7 @@ class MainWindow(QMainWindow):
 
         self.route_rows = []
         self.preview_layers = []
+        self._basemap_layer = None
 
         self._build_ui()
         self._load_config_into_ui()
@@ -133,6 +154,16 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.info_label)
         left_layout.addWidget(self.report_text, 1)
 
+        # --- Basemap switcher ---
+        basemap_row = QHBoxLayout()
+        basemap_row.addWidget(QLabel("Подложка:"))
+        self.basemap_combo = QComboBox()
+        for bm in BASEMAPS:
+            self.basemap_combo.addItem(bm["name"])
+        self.basemap_combo.currentIndexChanged.connect(self._switch_basemap)
+        basemap_row.addWidget(self.basemap_combo)
+        basemap_row.addStretch()
+
         self.canvas = QgsMapCanvas()
         self.canvas.setCanvasColor(Qt.white)
         self.canvas.enableAntiAliasing(True)
@@ -142,7 +173,36 @@ class MainWindow(QMainWindow):
             self.canvas
         )
 
+        right_layout.addLayout(basemap_row)
         right_layout.addWidget(self.canvas)
+
+    def _switch_basemap(self, index):
+        # Удаляем предыдущую подложку
+        if self._basemap_layer is not None:
+            self.project.removeMapLayer(self._basemap_layer.id())
+            self._basemap_layer = None
+
+        bm = BASEMAPS[index]
+        if bm["url"] is None:
+            self.canvas.refresh()
+            return
+
+        layer = QgsRasterLayer(bm["url"], bm["name"], "wms")
+        if not layer.isValid():
+            self.info_label.setText("Не удалось загрузить подложку: %s" % bm["name"])
+            return
+
+        self.project.addMapLayer(layer)
+        # Помещаем подложку в самый низ дерева слоёв
+        root = self.project.layerTreeRoot()
+        node = root.findLayer(layer.id())
+        if node:
+            clone = node.clone()
+            root.removeChildNode(node)
+            root.addChildNode(clone)
+
+        self._basemap_layer = layer
+        self.canvas.refresh()
 
     def _with_button(self, line_edit, button):
         w = QWidget()
@@ -184,11 +244,17 @@ class MainWindow(QMainWindow):
             self.raster_edit.setText(path)
 
     def clear_project(self):
+        bm_id = self._basemap_layer.id() if self._basemap_layer else None
         self.project.removeAllMapLayers()
         self.preview_layers = []
         self.route_combo.clear()
         self.route_rows = []
         self.report_text.clear()
+        self._basemap_layer = None
+        # Восстанавливаем подложку после очистки
+        idx = self.basemap_combo.currentIndex()
+        if idx > 0:
+            self._switch_basemap(idx)
 
     def load_gdb(self):
         try:
