@@ -17,7 +17,7 @@ from qgis_runtime import init_qgis, init_processing, shutdown_qgis
 QGS_APP = init_qgis(gui_enabled=True)
 init_processing()
 
-from qgis.PyQt.QtCore import Qt, QTimer
+from qgis.PyQt.QtCore import Qt, QTimer, pyqtSignal
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QComboBox,
@@ -41,9 +41,11 @@ from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsFeature,
+    QgsGeometry,
     QgsLayerTreeLayer,
     QgsLayerTreeModel,
     QgsLineSymbol,
+    QgsPointXY,
     QgsProject,
     QgsRasterLayer,
     QgsSimpleLineSymbolLayer,
@@ -53,13 +55,13 @@ from qgis.core import (
     QgsWkbTypes,
 )
 from qgis.gui import (
-    QgsAdvancedDigitizingDockWidget,
     QgsLayerTreeMapCanvasBridge,
     QgsLayerTreeView,
     QgsMapCanvas,
-    QgsMapToolDigitizeFeature,
     QgsMapToolEdit,
     QgsMapToolPan,
+    QgsRubberBand,
+    QgsMapTool,
 )
 
 from gdb_reader import (
@@ -105,6 +107,67 @@ def _apply_route_lines_style(layer: QgsVectorLayer):
     layer.setRenderer(QgsSingleSymbolRenderer(symbol))
 
 
+class LineDrawTool(QgsMapTool):
+    """Кастомный инструмент рисования линии.
+    Одинарный клик — добавить вершину, двойной клик — завершить.
+    Сигнал lineFinished(передаёт список QgsPointXY) по завершении.
+    """
+    lineFinished = pyqtSignal(list)  # list of QgsPointXY
+
+    def __init__(self, canvas: QgsMapCanvas):
+        super().__init__(canvas)
+        self._points: list[QgsPointXY] = []
+        self._rb = QgsRubberBand(canvas, QgsWkbTypes.GeometryType.LineGeometry)
+        self._rb.setColor(QColor(255, 0, 0, 180))
+        self._rb.setWidth(2)
+
+    def canvasPressEvent(self, e):
+        pass  # не используем, чтобы избежать конфликта с doubleClick
+
+    def canvasReleaseEvent(self, e):
+        pass
+
+    def canvasMoveEvent(self, e):
+        if self._points:
+            pt = self.toMapCoordinates(e.pos())
+            self._rb.movePoint(pt)
+
+    def canvasDoubleClickEvent(self, e):
+        if len(self._points) >= 2:
+            self._finish()
+        else:
+            self._points.append(self.toMapCoordinates(e.pos()))
+            self._rb.addPoint(self._points[-1])
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self._reset()
+            self.canvas().setMapTool(self.canvas().mapTool())  # вернуться к pan
+
+    def mousePressEvent(self, e):
+        """Qt mouse press — используем вместо canvas для одинарного клика."""
+        pass
+
+    def canvasClickEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            pt = self.toMapCoordinates(e.pos())
+            self._points.append(pt)
+            self._rb.addPoint(pt)
+
+    def _finish(self):
+        pts = list(self._points)
+        self._reset()
+        self.lineFinished.emit(pts)
+
+    def _reset(self):
+        self._points = []
+        self._rb.reset(QgsWkbTypes.GeometryType.LineGeometry)
+
+    def deactivate(self):
+        self._reset()
+        super().deactivate()
+
+
 class RouteNameDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -138,7 +201,7 @@ class MainWindow(QMainWindow):
         self.preview_layers = []
         self._basemap_layer_id = None
         self._route_layer: QgsVectorLayer | None = None
-        self._digitize_tool = None
+        self._draw_tool: LineDrawTool | None = None
 
         self._build_ui()
         self._load_config_into_ui()
@@ -163,7 +226,6 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(4, 4, 4, 4)
         root_layout.addWidget(main_splitter)
 
-        # --- Левая панель ---
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 4, 0)
 
@@ -213,7 +275,6 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.info_label)
         left_layout.addWidget(self.report_text, 1)
 
-        # --- Правая панель ---
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -227,10 +288,9 @@ class MainWindow(QMainWindow):
         basemap_row.addStretch()
         right_layout.addLayout(basemap_row)
 
-        # Тулбар редактирования RouteLines
         edit_bar = QHBoxLayout()
         self.btn_new_line = QPushButton("⊕ Новая линия")
-        self.btn_new_line.clicked.connect(self._start_digitize)
+        self.btn_new_line.clicked.connect(self._start_draw)
         self.btn_new_line.setEnabled(False)
         self.btn_vertex_edit = QPushButton("▦ Вершины")
         self.btn_vertex_edit.clicked.connect(self._start_vertex_edit)
@@ -281,42 +341,50 @@ class MainWindow(QMainWindow):
         self.canvas.setMapTool(self._pan_tool)
         self.canvas.setWheelFactor(2.0)
 
-        # CAD dock нужен для QgsMapToolDigitizeFeature, не отображается
-        self._cad_dock = QgsAdvancedDigitizingDockWidget(self.canvas)
-
     # ------------------------------------------------------------------
     # Редактирование RouteLines
     # ------------------------------------------------------------------
     def _enable_edit_toolbar(self):
-        """Activates toolbar buttons after GDB load."""
         for btn in (self.btn_new_line, self.btn_vertex_edit, self.btn_delete,
                     self.btn_save, self.btn_cancel_edit):
             btn.setEnabled(True)
 
-    def _start_digitize(self):
+    def _start_draw(self):
         if self._route_layer is None:
             return
-        # Убедиться что слой в режиме редактирования
-        if not self._route_layer.isEditable():
-            self._route_layer.startEditing()
-        tool = QgsMapToolDigitizeFeature(self.canvas, self._cad_dock)
-        tool.setLayer(self._route_layer)
-        tool.digitizingCompleted.connect(self._on_digitize_completed)
-        self._digitize_tool = tool
+        tool = LineDrawTool(self.canvas)
+        tool.lineFinished.connect(self._on_line_finished)
+        self._draw_tool = tool
         self.canvas.setMapTool(tool)
-        self.info_label.setText("Кликайте для добавления вершин. Двойной клик — завершить.")
+        self.info_label.setText("Кликайте для добавления вершин. Двойной клик — завершить. Esc — отмена.")
 
-    def _on_digitize_completed(self, feature: QgsFeature):
+    def _on_line_finished(self, points: list):
+        if len(points) < 2:
+            self.info_label.setText("Слишком мало вершин (нужно мин. 2).")
+            self.canvas.setMapTool(self._pan_tool)
+            return
+
         dlg = RouteNameDialog(self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             self.info_label.setText("Создание отменено.")
             self.canvas.setMapTool(self._pan_tool)
-            self._digitize_tool = None
             return
+
         name = dlg.route_name()
-        feature[self.config["route_name_field"]] = name
-        self._route_layer.addFeature(feature)
-        self._digitize_tool = None
+
+        # Переводим точки из CRS канваса в CRS слоя
+        canvas_crs = self.canvas.mapSettings().destinationCrs()
+        layer_crs = self._route_layer.crs()
+        transform = QgsCoordinateTransform(canvas_crs, layer_crs, self.project)
+        layer_points = [transform.transform(pt) for pt in points]
+
+        geom = QgsGeometry.fromPolylineXY(layer_points)
+        feat = QgsFeature(self._route_layer.fields())
+        feat.setGeometry(geom)
+        feat[self.config["route_name_field"]] = name
+
+        self._route_layer.addFeature(feat)
+        self._draw_tool = None
         self.canvas.setMapTool(self._pan_tool)
         self.canvas.refresh()
         self.info_label.setText("Линия «%s» добавлена. Не забудьте сохранить." % name)
@@ -324,8 +392,6 @@ class MainWindow(QMainWindow):
     def _start_vertex_edit(self):
         if self._route_layer is None:
             return
-        if not self._route_layer.isEditable():
-            self._route_layer.startEditing()
         tool = QgsMapToolEdit(self.canvas)
         self.canvas.setMapTool(tool)
         self.info_label.setText("Кликните на линию и перетащивайте вершины.")
@@ -345,7 +411,7 @@ class MainWindow(QMainWindow):
         if self._route_layer is None:
             return
         self._route_layer.commitChanges()
-        self._route_layer.startEditing()  # остаёмся в режиме редактирования
+        self._route_layer.startEditing()
         self.canvas.setMapTool(self._pan_tool)
         self._refresh_route_combo()
         self.info_label.setText("Изменения сохранены.")
@@ -354,7 +420,7 @@ class MainWindow(QMainWindow):
         if self._route_layer is None:
             return
         self._route_layer.rollBack()
-        self._route_layer.startEditing()  # остаёмся в режиме редактирования
+        self._route_layer.startEditing()
         self.canvas.setMapTool(self._pan_tool)
         self.canvas.refresh()
         self.info_label.setText("Изменения отменены.")
