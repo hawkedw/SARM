@@ -20,6 +20,7 @@ init_processing()
 from qgis.PyQt.QtCore import Qt, QTimer, pyqtSignal
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -108,51 +109,55 @@ def _apply_route_lines_style(layer: QgsVectorLayer):
 
 
 class LineDrawTool(QgsMapTool):
-    """Кастомный инструмент рисования линии.
-    Одинарный клик — добавить вершину, двойной клик — завершить.
-    Сигнал lineFinished(передаёт список QgsPointXY) по завершении.
-    """
-    lineFinished = pyqtSignal(list)  # list of QgsPointXY
+    """Single click — add vertex. Double click — finish line."""
+    lineFinished = pyqtSignal(list)  # list[QgsPointXY]
 
     def __init__(self, canvas: QgsMapCanvas):
         super().__init__(canvas)
         self._points: list[QgsPointXY] = []
+        self._pending_pt: QgsPointXY | None = None
         self._rb = QgsRubberBand(canvas, QgsWkbTypes.GeometryType.LineGeometry)
         self._rb.setColor(QColor(255, 0, 0, 180))
         self._rb.setWidth(2)
-
-    def canvasPressEvent(self, e):
-        pass  # не используем, чтобы избежать конфликта с doubleClick
-
-    def canvasReleaseEvent(self, e):
-        pass
+        # Таймер для различения single/double click
+        self._click_timer = QTimer()
+        self._click_timer.setSingleShot(True)
+        self._click_timer.setInterval(QApplication.doubleClickInterval())
+        self._click_timer.timeout.connect(self._commit_pending)
 
     def canvasMoveEvent(self, e):
         if self._points:
             pt = self.toMapCoordinates(e.pos())
-            self._rb.movePoint(pt)
+            if self._rb.numberOfVertices() > len(self._points):
+                self._rb.movePoint(pt)
+            else:
+                self._rb.addPoint(pt)
 
-    def canvasDoubleClickEvent(self, e):
-        if len(self._points) >= 2:
+    def canvasPressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        pt = self.toMapCoordinates(e.pos())
+        if self._click_timer.isActive():
+            # Это двойной клик — отменяем таймер, финишим
+            self._click_timer.stop()
+            self._pending_pt = None
             self._finish()
         else:
-            self._points.append(self.toMapCoordinates(e.pos()))
-            self._rb.addPoint(self._points[-1])
+            # Первый клик — откладываем добавление вершины
+            self._pending_pt = pt
+            self._click_timer.start()
+
+    def _commit_pending(self):
+        """Single click confirmed — add vertex."""
+        if self._pending_pt is not None:
+            self._points.append(self._pending_pt)
+            self._pending_pt = None
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Escape:
+            self._click_timer.stop()
             self._reset()
-            self.canvas().setMapTool(self.canvas().mapTool())  # вернуться к pan
-
-    def mousePressEvent(self, e):
-        """Qt mouse press — используем вместо canvas для одинарного клика."""
-        pass
-
-    def canvasClickEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton:
-            pt = self.toMapCoordinates(e.pos())
-            self._points.append(pt)
-            self._rb.addPoint(pt)
+            self.canvas().unsetMapTool(self)
 
     def _finish(self):
         pts = list(self._points)
@@ -161,9 +166,11 @@ class LineDrawTool(QgsMapTool):
 
     def _reset(self):
         self._points = []
+        self._pending_pt = None
         self._rb.reset(QgsWkbTypes.GeometryType.LineGeometry)
 
     def deactivate(self):
+        self._click_timer.stop()
         self._reset()
         super().deactivate()
 
@@ -342,8 +349,6 @@ class MainWindow(QMainWindow):
         self.canvas.setWheelFactor(2.0)
 
     # ------------------------------------------------------------------
-    # Редактирование RouteLines
-    # ------------------------------------------------------------------
     def _enable_edit_toolbar(self):
         for btn in (self.btn_new_line, self.btn_vertex_edit, self.btn_delete,
                     self.btn_save, self.btn_cancel_edit):
@@ -356,23 +361,22 @@ class MainWindow(QMainWindow):
         tool.lineFinished.connect(self._on_line_finished)
         self._draw_tool = tool
         self.canvas.setMapTool(tool)
-        self.info_label.setText("Кликайте для добавления вершин. Двойной клик — завершить. Esc — отмена.")
+        self.info_label.setText("Клик — вершина. Двойной клик — завершить. Esc — отмена.")
 
     def _on_line_finished(self, points: list):
+        self.canvas.setMapTool(self._pan_tool)
+        self._draw_tool = None
+
         if len(points) < 2:
-            self.info_label.setText("Слишком мало вершин (нужно мин. 2).")
-            self.canvas.setMapTool(self._pan_tool)
+            self.info_label.setText("Нужно минимум 2 вершины.")
             return
 
         dlg = RouteNameDialog(self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             self.info_label.setText("Создание отменено.")
-            self.canvas.setMapTool(self._pan_tool)
             return
 
         name = dlg.route_name()
-
-        # Переводим точки из CRS канваса в CRS слоя
         canvas_crs = self.canvas.mapSettings().destinationCrs()
         layer_crs = self._route_layer.crs()
         transform = QgsCoordinateTransform(canvas_crs, layer_crs, self.project)
@@ -382,10 +386,7 @@ class MainWindow(QMainWindow):
         feat = QgsFeature(self._route_layer.fields())
         feat.setGeometry(geom)
         feat[self.config["route_name_field"]] = name
-
         self._route_layer.addFeature(feat)
-        self._draw_tool = None
-        self.canvas.setMapTool(self._pan_tool)
         self.canvas.refresh()
         self.info_label.setText("Линия «%s» добавлена. Не забудьте сохранить." % name)
 
