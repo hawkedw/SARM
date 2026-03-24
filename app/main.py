@@ -45,6 +45,7 @@ from qgis.core import (
     QgsRasterLayer,
     QgsSimpleLineSymbolLayer,
     QgsSingleSymbolRenderer,
+    QgsUnitTypes,
     QgsVectorLayer,
     QgsWkbTypes,
 )
@@ -75,28 +76,28 @@ BASEMAPS = [
 CRS_3857 = QgsCoordinateReferenceSystem("EPSG:3857")
 RASTER_EXTENSIONS = {".tif", ".tiff", ".img", ".ecw", ".jp2", ".vrt"}
 
-# Порядок групп в дереве слоёв (сверху вниз)
 _GEOM_ORDER = {
     QgsWkbTypes.GeometryType.PointGeometry:   0,
     QgsWkbTypes.GeometryType.LineGeometry:    1,
     QgsWkbTypes.GeometryType.PolygonGeometry: 2,
 }
 
+RENDER_POINTS = QgsUnitTypes.RenderUnit.RenderPoints
+
 
 def _apply_route_lines_style(layer: QgsVectorLayer):
-    """2 твёрдых линии: нижняя чёрная 2.8pt, верхняя красная 2.8pt"""
     black = QgsSimpleLineSymbolLayer(QColor(0, 0, 0))
     black.setWidth(2.8)
-    black.setWidthUnit(QgsSimpleLineSymbolLayer.RenderUnit.RenderPoints)
+    black.setWidthUnit(RENDER_POINTS)
 
     red = QgsSimpleLineSymbolLayer(QColor(220, 0, 0))
     red.setWidth(2.8)
-    red.setWidthUnit(QgsSimpleLineSymbolLayer.RenderUnit.RenderPoints)
+    red.setWidthUnit(RENDER_POINTS)
 
     symbol = QgsLineSymbol()
-    symbol.deleteSymbolLayer(0)      # удаляем дефолтный слой
-    symbol.appendSymbolLayer(black)  # нижний
-    symbol.appendSymbolLayer(red)    # верхний
+    symbol.deleteSymbolLayer(0)
+    symbol.appendSymbolLayer(black)
+    symbol.appendSymbolLayer(red)
 
     layer.setRenderer(QgsSingleSymbolRenderer(symbol))
 
@@ -232,15 +233,11 @@ class MainWindow(QMainWindow):
 
         right_layout.addWidget(map_splitter, 1)
 
-        # Инструмент перемещения + зум колесиком
         self._pan_tool = QgsMapToolPan(self.canvas)
         self.canvas.setMapTool(self._pan_tool)
         self.canvas.setWheelFactor(2.0)
 
-    # ------------------------------------------------------------------
     def _add_layer_ordered(self, layer, visible: bool = True):
-        """Reгистрируем слой без автодобавления в дерево,
-        затем вставляем в правильную позицию в соответствии с типом."""
         self.project.addMapLayer(layer, False)
         root = self.project.layerTreeRoot()
         node = QgsLayerTreeLayer(layer)
@@ -249,25 +246,23 @@ class MainWindow(QMainWindow):
         is_vector = isinstance(layer, QgsVectorLayer)
         geom_order = _GEOM_ORDER.get(
             layer.geometryType() if is_vector else None, 3
-        ) if is_vector else 3  # raster = 3
+        ) if is_vector else 3
 
-        # Находим позицию: вставить перед первым слоем с большим или равным порядком
         children = root.children()
-        insert_pos = len(children)  # по умолчанию в конец
+        insert_pos = len(children)
         for i, child in enumerate(children):
             if not isinstance(child, QgsLayerTreeLayer):
                 continue
             child_layer = child.layer()
             if child_layer is None:
                 continue
+            if child_layer.id() == self._basemap_layer_id:
+                insert_pos = i
+                break
             child_is_vec = isinstance(child_layer, QgsVectorLayer)
             child_order = _GEOM_ORDER.get(
                 child_layer.geometryType() if child_is_vec else None, 3
             ) if child_is_vec else 3
-            # подложка (id == _basemap_layer_id) всегда остаётся в конце
-            if child_layer.id() == self._basemap_layer_id:
-                insert_pos = i
-                break
             if child_order > geom_order:
                 insert_pos = i
                 break
@@ -275,7 +270,6 @@ class MainWindow(QMainWindow):
         root.insertChildNode(insert_pos, node)
         self.preview_layers.append(layer)
 
-    # ------------------------------------------------------------------
     def _switch_basemap(self, index):
         if self._basemap_layer_id is not None:
             self.project.removeMapLayer(self._basemap_layer_id)
@@ -379,7 +373,6 @@ class MainWindow(QMainWindow):
             if route_layer_name not in vector_names:
                 raise RuntimeError("Слой %s не найден" % route_layer_name)
 
-            # Загружаем все векторные слои с автосортировкой
             route_layer = None
             for name in vector_names:
                 try:
@@ -391,7 +384,6 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-            # Растры из GDB (видимы)
             for item in raster_items:
                 try:
                     layer = load_raster_layer(item["source"], item["name"])
@@ -399,7 +391,6 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-            # Растры из папки (сняты с видимости)
             folder_raster_count = 0
             if raster_folder:
                 folder_raster_count = self._load_rasters_from_folder(raster_folder)
