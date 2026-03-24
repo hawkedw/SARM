@@ -21,6 +21,8 @@ from qgis.PyQt.QtCore import Qt, QTimer
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QDoubleSpinBox,
     QFormLayout,
@@ -38,6 +40,7 @@ from qgis.PyQt.QtWidgets import (
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
+    QgsFeature,
     QgsLayerTreeLayer,
     QgsLayerTreeModel,
     QgsLineSymbol,
@@ -53,7 +56,9 @@ from qgis.gui import (
     QgsLayerTreeMapCanvasBridge,
     QgsLayerTreeView,
     QgsMapCanvas,
+    QgsMapToolDigitizeFeature,
     QgsMapToolPan,
+    QgsMapToolVertexEdit,
 )
 
 from gdb_reader import (
@@ -89,17 +94,33 @@ def _apply_route_lines_style(layer: QgsVectorLayer):
     black = QgsSimpleLineSymbolLayer(QColor(0, 0, 0))
     black.setWidth(2.8)
     black.setWidthUnit(RENDER_POINTS)
-
     red = QgsSimpleLineSymbolLayer(QColor(220, 0, 0))
     red.setWidth(2.8)
     red.setWidthUnit(RENDER_POINTS)
-
     symbol = QgsLineSymbol()
     symbol.deleteSymbolLayer(0)
     symbol.appendSymbolLayer(black)
     symbol.appendSymbolLayer(red)
-
     layer.setRenderer(QgsSingleSymbolRenderer(symbol))
+
+
+class RouteNameDialog(QDialog):
+    """Простой диалог для ввода названия нового маршрута."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Новый маршрут")
+        self.setFixedWidth(320)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Название маршрута:"))
+        self.name_edit = QLineEdit()
+        layout.addWidget(self.name_edit)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def route_name(self) -> str:
+        return self.name_edit.text().strip()
 
 
 class MainWindow(QMainWindow):
@@ -116,6 +137,8 @@ class MainWindow(QMainWindow):
         self.route_rows = []
         self.preview_layers = []
         self._basemap_layer_id = None
+        self._route_layer: QgsVectorLayer | None = None
+        self._editing = False
 
         self._build_ui()
         self._load_config_into_ui()
@@ -123,6 +146,7 @@ class MainWindow(QMainWindow):
         self.canvas.setDestinationCrs(CRS_3857)
         QTimer.singleShot(200, lambda: self.basemap_combo.setCurrentIndex(1))
 
+    # ------------------------------------------------------------------
     def _build_ui(self):
         root = QWidget()
         self.setCentralWidget(root)
@@ -140,11 +164,11 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(4, 4, 4, 4)
         root_layout.addWidget(main_splitter)
 
+        # --- Левая панель ---
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 4, 0)
 
         form = QFormLayout()
-
         self.gdb_edit = QLineEdit()
         gdb_btn = QPushButton("...")
         gdb_btn.setFixedWidth(28)
@@ -176,14 +200,12 @@ class MainWindow(QMainWindow):
         self.load_btn.clicked.connect(self.load_gdb)
         self.run_btn = QPushButton("Run")
         self.run_btn.clicked.connect(self.run_export)
-
         btn_row = QHBoxLayout()
         btn_row.addWidget(self.load_btn)
         btn_row.addWidget(self.run_btn)
 
         self.info_label = QLabel("Готово")
         self.info_label.setWordWrap(True)
-
         self.report_text = QPlainTextEdit()
         self.report_text.setReadOnly(True)
 
@@ -192,9 +214,11 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.info_label)
         left_layout.addWidget(self.report_text, 1)
 
+        # --- Правая панель ---
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
+        # Строка: подложка
         basemap_row = QHBoxLayout()
         basemap_row.addWidget(QLabel("Подложка:"))
         self.basemap_combo = QComboBox()
@@ -205,17 +229,44 @@ class MainWindow(QMainWindow):
         basemap_row.addStretch()
         right_layout.addLayout(basemap_row)
 
-        map_splitter = QSplitter(Qt.Orientation.Horizontal)
+        # Тулбар редактирования RouteLines
+        edit_bar = QHBoxLayout()
+        self.btn_edit_toggle = QPushButton("✒ Редактировать")
+        self.btn_edit_toggle.setCheckable(True)
+        self.btn_edit_toggle.clicked.connect(self._toggle_edit)
+        self.btn_new_line = QPushButton("⊕ Новая линия")
+        self.btn_new_line.clicked.connect(self._start_digitize)
+        self.btn_vertex_edit = QPushButton("▦ Вершины")
+        self.btn_vertex_edit.clicked.connect(self._start_vertex_edit)
+        self.btn_delete = QPushButton("✘ Удалить")
+        self.btn_delete.clicked.connect(self._delete_selected)
+        self.btn_save = QPushButton("💾 Сохранить")
+        self.btn_save.clicked.connect(self._save_edits)
+        self.btn_cancel = QPushButton("✕ Отменить")
+        self.btn_cancel.clicked.connect(self._cancel_edits)
 
+        for btn in (self.btn_new_line, self.btn_vertex_edit, self.btn_delete,
+                    self.btn_save, self.btn_cancel):
+            btn.setEnabled(False)
+
+        edit_bar.addWidget(self.btn_edit_toggle)
+        edit_bar.addWidget(self.btn_new_line)
+        edit_bar.addWidget(self.btn_vertex_edit)
+        edit_bar.addWidget(self.btn_delete)
+        edit_bar.addStretch()
+        edit_bar.addWidget(self.btn_save)
+        edit_bar.addWidget(self.btn_cancel)
+        right_layout.addLayout(edit_bar)
+
+        # Канвас + дерево слоёв
+        map_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.canvas = QgsMapCanvas()
         self.canvas.setCanvasColor(QColor(255, 255, 255))
         self.canvas.enableAntiAliasing(True)
 
         self.bridge = QgsLayerTreeMapCanvasBridge(
-            self.project.layerTreeRoot(),
-            self.canvas
+            self.project.layerTreeRoot(), self.canvas
         )
-
         self._layer_tree_model = QgsLayerTreeModel(self.project.layerTreeRoot())
         self._layer_tree_model.setFlag(QgsLayerTreeModel.Flag.AllowNodeReorder)
         self._layer_tree_model.setFlag(QgsLayerTreeModel.Flag.AllowNodeRename, False)
@@ -230,13 +281,122 @@ class MainWindow(QMainWindow):
         map_splitter.setStretchFactor(0, 0)
         map_splitter.setStretchFactor(1, 1)
         map_splitter.setSizes([220, 1060])
-
         right_layout.addWidget(map_splitter, 1)
 
         self._pan_tool = QgsMapToolPan(self.canvas)
         self.canvas.setMapTool(self._pan_tool)
         self.canvas.setWheelFactor(2.0)
 
+    # ------------------------------------------------------------------
+    # Редактирование RouteLines
+    # ------------------------------------------------------------------
+    def _toggle_edit(self, checked: bool):
+        if self._route_layer is None:
+            self.btn_edit_toggle.setChecked(False)
+            return
+        if checked:
+            self._route_layer.startEditing()
+            self._editing = True
+            self.btn_edit_toggle.setText("🔒 Завершить редактирование")
+            for btn in (self.btn_new_line, self.btn_vertex_edit, self.btn_delete,
+                        self.btn_save, self.btn_cancel):
+                btn.setEnabled(True)
+        else:
+            # Если есть несохранённые изменения — спросить
+            if self._route_layer.isModified():
+                reply = QMessageBox.question(
+                    self, "Сохранить?",
+                    "Есть несохранённые изменения. Сохранить?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self._save_edits()
+                else:
+                    self._cancel_edits()
+            else:
+                self._stop_editing()
+
+    def _stop_editing(self):
+        self._editing = False
+        self.btn_edit_toggle.setText("✒ Редактировать")
+        self.btn_edit_toggle.setChecked(False)
+        for btn in (self.btn_new_line, self.btn_vertex_edit, self.btn_delete,
+                    self.btn_save, self.btn_cancel):
+            btn.setEnabled(False)
+        self.canvas.setMapTool(self._pan_tool)
+
+    def _start_digitize(self):
+        if self._route_layer is None:
+            return
+        tool = QgsMapToolDigitizeFeature(self.canvas, self._route_layer)
+        tool.digitizingCompleted.connect(self._on_digitize_completed)
+        self.canvas.setMapTool(tool)
+        self.info_label.setText("Кликайте для добавления вершин. Двойной клик — завершить.")
+
+    def _on_digitize_completed(self, feature: QgsFeature):
+        dlg = RouteNameDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            self.info_label.setText("Создание отменено.")
+            self.canvas.setMapTool(self._pan_tool)
+            return
+        name = dlg.route_name()
+        feature[self.config["route_name_field"]] = name
+        self._route_layer.addFeature(feature)
+        self.canvas.setMapTool(self._pan_tool)
+        self.canvas.refresh()
+        self.info_label.setText("Линия «%s» добавлена. Не забудьте сохранить." % name)
+
+    def _start_vertex_edit(self):
+        if self._route_layer is None:
+            return
+        tool = QgsMapToolVertexEdit(self.canvas)
+        self.canvas.setMapTool(tool)
+        self.info_label.setText("Кликните на линию для редактирования вершин.")
+
+    def _delete_selected(self):
+        if self._route_layer is None:
+            return
+        selected = self._route_layer.selectedFeatureIds()
+        if not selected:
+            self.info_label.setText("Сначала выберите линию кликом.")
+            return
+        self._route_layer.deleteFeatures(list(selected))
+        self.canvas.refresh()
+        self.info_label.setText("Удалено %d объектов." % len(selected))
+
+    def _save_edits(self):
+        if self._route_layer is None:
+            return
+        self._route_layer.commitChanges()
+        self._stop_editing()
+        self._refresh_route_combo()
+        self.info_label.setText("Изменения сохранены.")
+
+    def _cancel_edits(self):
+        if self._route_layer is None:
+            return
+        self._route_layer.rollBack()
+        self._stop_editing()
+        self.canvas.refresh()
+        self.info_label.setText("Изменения отменены.")
+
+    def _refresh_route_combo(self):
+        if self._route_layer is None:
+            return
+        current_fid = self.route_combo.currentData()
+        self.route_combo.clear()
+        self.route_rows = get_route_choices(
+            self._route_layer, self.config["route_name_field"]
+        )
+        for row in self.route_rows:
+            self.route_combo.addItem(row["label"], row["fid"])
+        # восстановить выбор если fid ещё есть
+        for i in range(self.route_combo.count()):
+            if self.route_combo.itemData(i) == current_fid:
+                self.route_combo.setCurrentIndex(i)
+                break
+
+    # ------------------------------------------------------------------
     def _add_layer_ordered(self, layer, visible: bool = True):
         self.project.addMapLayer(layer, False)
         root = self.project.layerTreeRoot()
@@ -274,17 +434,14 @@ class MainWindow(QMainWindow):
         if self._basemap_layer_id is not None:
             self.project.removeMapLayer(self._basemap_layer_id)
             self._basemap_layer_id = None
-
         bm = BASEMAPS[index]
         if bm["url"] is None:
             self.canvas.refresh()
             return
-
         layer = QgsRasterLayer(bm["url"], bm["name"], "wms")
         if not layer.isValid():
             self.info_label.setText("Не удалось загрузить подложку: %s" % bm["name"])
             return
-
         self.project.addMapLayer(layer, False)
         self._basemap_layer_id = layer.id()
         root = self.project.layerTreeRoot()
@@ -344,12 +501,16 @@ class MainWindow(QMainWindow):
         return count
 
     def clear_project(self):
+        if self._editing:
+            self._cancel_edits()
         self.project.removeAllMapLayers()
         self._basemap_layer_id = None
+        self._route_layer = None
         self.preview_layers = []
         self.route_combo.clear()
         self.route_rows = []
         self.report_text.clear()
+        self.btn_edit_toggle.setEnabled(False)
         idx = self.basemap_combo.currentIndex()
         if idx > 0:
             self._switch_basemap(idx)
@@ -398,6 +559,9 @@ class MainWindow(QMainWindow):
             if route_layer is None:
                 raise RuntimeError("Не удалось загрузить %s" % route_layer_name)
 
+            self._route_layer = route_layer
+            self.btn_edit_toggle.setEnabled(True)
+
             self.route_rows = get_route_choices(route_layer, route_name_field)
             for row in self.route_rows:
                 self.route_combo.addItem(row["label"], row["fid"])
@@ -424,7 +588,6 @@ class MainWindow(QMainWindow):
     def run_export(self):
         try:
             self._save_ui_to_config()
-
             gdb_path = self.gdb_edit.text().strip()
             output_root = self.output_edit.text().strip()
             input_rasters = self.raster_edit.text().strip()
