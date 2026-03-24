@@ -109,53 +109,58 @@ def _apply_route_lines_style(layer: QgsVectorLayer):
 
 
 class LineDrawTool(QgsMapTool):
-    """Single click — add vertex. Double click — finish line."""
+    """
+    Left click  — добавить вершину немедленно.
+    Double click — отменить лишнюю вершину (добавленную первым press) и финишировать.
+    Esc         — отмена.
+    """
     lineFinished = pyqtSignal(list)  # list[QgsPointXY]
 
     def __init__(self, canvas: QgsMapCanvas):
         super().__init__(canvas)
         self._points: list[QgsPointXY] = []
-        self._pending_pt: QgsPointXY | None = None
         self._rb = QgsRubberBand(canvas, QgsWkbTypes.GeometryType.LineGeometry)
-        self._rb.setColor(QColor(255, 0, 0, 180))
+        self._rb.setColor(QColor(255, 0, 0, 200))
         self._rb.setWidth(2)
-        # Таймер для различения single/double click
-        self._click_timer = QTimer()
-        self._click_timer.setSingleShot(True)
-        self._click_timer.setInterval(QApplication.doubleClickInterval())
-        self._click_timer.timeout.connect(self._commit_pending)
-
-    def canvasMoveEvent(self, e):
-        if self._points:
-            pt = self.toMapCoordinates(e.pos())
-            if self._rb.numberOfVertices() > len(self._points):
-                self._rb.movePoint(pt)
-            else:
-                self._rb.addPoint(pt)
 
     def canvasPressEvent(self, e):
+        """Every press — add vertex immediately at exact click position."""
         if e.button() != Qt.MouseButton.LeftButton:
             return
         pt = self.toMapCoordinates(e.pos())
-        if self._click_timer.isActive():
-            # Это двойной клик — отменяем таймер, финишим
-            self._click_timer.stop()
-            self._pending_pt = None
+        self._points.append(pt)
+        self._rb.addPoint(pt)
+
+    def canvasDoubleClickEvent(self, e):
+        """Double click: Qt already fired one press before this.
+        Remove that extra vertex, then finish."""
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        # Убираем последнюю вершину — её добавил canvasPressEvent первого клика двойного
+        if self._points:
+            self._points.pop()
+            self._rb.removeLastPoint()
+        if len(self._points) >= 2:
             self._finish()
         else:
-            # Первый клик — откладываем добавление вершины
-            self._pending_pt = pt
-            self._click_timer.start()
+            self.info_too_few()
 
-    def _commit_pending(self):
-        """Single click confirmed — add vertex."""
-        if self._pending_pt is not None:
-            self._points.append(self._pending_pt)
-            self._pending_pt = None
+    def info_too_few(self):
+        pass  # обрабатывается в MainWindow через сигнал
+
+    def canvasMoveEvent(self, e):
+        """Rubber band preview — only the trailing segment follows cursor."""
+        if not self._points:
+            return
+        pt = self.toMapCoordinates(e.pos())
+        # Если trailing-точка уже есть — двигаем её; иначе добавляем
+        if self._rb.numberOfVertices() > len(self._points):
+            self._rb.movePoint(pt)
+        else:
+            self._rb.addPoint(pt)
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Escape:
-            self._click_timer.stop()
             self._reset()
             self.canvas().unsetMapTool(self)
 
@@ -166,11 +171,9 @@ class LineDrawTool(QgsMapTool):
 
     def _reset(self):
         self._points = []
-        self._pending_pt = None
         self._rb.reset(QgsWkbTypes.GeometryType.LineGeometry)
 
     def deactivate(self):
-        self._click_timer.stop()
         self._reset()
         super().deactivate()
 
@@ -441,7 +444,6 @@ class MainWindow(QMainWindow):
                 self.route_combo.setCurrentIndex(i)
                 break
 
-    # ------------------------------------------------------------------
     def _add_layer_ordered(self, layer, visible: bool = True):
         self.project.addMapLayer(layer, False)
         root = self.project.layerTreeRoot()
