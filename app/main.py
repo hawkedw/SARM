@@ -53,6 +53,7 @@ from qgis.core import (
     QgsWkbTypes,
 )
 from qgis.gui import (
+    QgsAdvancedDigitizingDockWidget,
     QgsLayerTreeMapCanvasBridge,
     QgsLayerTreeView,
     QgsMapCanvas,
@@ -138,6 +139,7 @@ class MainWindow(QMainWindow):
         self._basemap_layer_id = None
         self._route_layer: QgsVectorLayer | None = None
         self._editing = False
+        self._digitize_tool = None
 
         self._build_ui()
         self._load_config_into_ui()
@@ -282,6 +284,9 @@ class MainWindow(QMainWindow):
         self.canvas.setMapTool(self._pan_tool)
         self.canvas.setWheelFactor(2.0)
 
+        # CAD dock нужен для QgsMapToolDigitizeFeature
+        self._cad_dock = QgsAdvancedDigitizingDockWidget(self.canvas)
+
     # ------------------------------------------------------------------
     # Редактирование RouteLines
     # ------------------------------------------------------------------
@@ -322,8 +327,10 @@ class MainWindow(QMainWindow):
     def _start_digitize(self):
         if self._route_layer is None:
             return
-        tool = QgsMapToolDigitizeFeature(self.canvas, self._route_layer)
+        tool = QgsMapToolDigitizeFeature(self.canvas, self._cad_dock)
+        tool.setLayer(self._route_layer)
         tool.digitizingCompleted.connect(self._on_digitize_completed)
+        self._digitize_tool = tool  # удерживаем ссылку
         self.canvas.setMapTool(tool)
         self.info_label.setText("Кликайте для добавления вершин. Двойной клик — завершить.")
 
@@ -336,12 +343,12 @@ class MainWindow(QMainWindow):
         name = dlg.route_name()
         feature[self.config["route_name_field"]] = name
         self._route_layer.addFeature(feature)
+        self._digitize_tool = None
         self.canvas.setMapTool(self._pan_tool)
         self.canvas.refresh()
         self.info_label.setText("Линия «%s» добавлена. Не забудьте сохранить." % name)
 
     def _start_vertex_edit(self):
-        """QgsMapToolEdit — перетаскивание вершин при активном режиме редактирования слоя."""
         if self._route_layer is None:
             return
         tool = QgsMapToolEdit(self.canvas)
