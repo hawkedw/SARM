@@ -4,6 +4,13 @@ import os
 import sys
 
 
+APP_DIR = Path(__file__).resolve().parent
+ROOT_DIR = APP_DIR.parent
+GIS_DIR = ROOT_DIR / "gis"
+QGIS_DIR = GIS_DIR / "apps" / "qgis"
+PY_DIR = GIS_DIR / "apps" / "Python312"
+
+
 def _prepend_env_path(var_name: str, values: List[str]) -> None:
     existing = os.environ.get(var_name, "")
     parts = [v for v in values if v]
@@ -20,59 +27,26 @@ def _add_sys_paths(paths: List[Path]) -> None:
                 sys.path.insert(0, s)
 
 
-def resolve_qgis_prefix(prefix_path: str) -> Path:
-    root = Path(prefix_path).resolve()
-    candidates = [
-        root / "apps" / "qgis",
-        root,
+def bootstrap_qgis(prefix_path: str = None) -> None:
+    """prefix_path игнорируется — все пути берутся относительно APP_DIR"""
+    python_paths = [
+        QGIS_DIR / "python",
+        QGIS_DIR / "python" / "plugins",
+        PY_DIR / "Lib" / "site-packages",
     ]
+    _add_sys_paths(python_paths)
 
-    for c in candidates:
-        if (c / "python").exists() or (c / "bin").exists():
-            return c
+    bin_paths = [str(QGIS_DIR / "bin"), str(GIS_DIR / "bin")]
+    _prepend_env_path("PATH", bin_paths)
 
-    return root
-
-
-def bootstrap_qgis(prefix_path: str) -> None:
-    root = Path(prefix_path).resolve()
-
-    qgis_apps = root / "apps" / "qgis"
-    share_ngqgis_python = root / "share" / "ngqgis" / "python"
-    share_ngqgis_plugins = share_ngqgis_python / "plugins"
-
-    python_candidates = [
-        qgis_apps / "python",
-        root / "python",
-        share_ngqgis_python,
-    ]
-
-    plugin_candidates = [
-        qgis_apps / "python" / "plugins",
-        root / "python" / "plugins",
-        share_ngqgis_plugins,
-    ]
-
-    bin_candidates = [
-        root / "bin",
-        qgis_apps / "bin",
-    ]
-
-    _add_sys_paths(python_candidates + plugin_candidates)
-
-    existing_bins = [str(p) for p in bin_candidates if p.exists()]
-    if existing_bins:
-        _prepend_env_path("PATH", existing_bins)
-
-    os.environ["QGIS_PREFIX_PATH"] = str(qgis_apps if qgis_apps.exists() else root)
+    os.environ.setdefault("QGIS_PREFIX_PATH", str(QGIS_DIR))
+    os.environ.setdefault("GDAL_DATA", str(GIS_DIR / "apps" / "gdal" / "share" / "gdal"))
+    os.environ.setdefault("PROJ_LIB", str(GIS_DIR / "share" / "proj"))
 
 
-def init_qgis(prefix_path: str, gui_enabled: bool = True):
-    real_prefix = os.environ.get("QGIS_PREFIX_PATH", str(resolve_qgis_prefix(prefix_path)))
-
+def init_qgis(prefix_path: str = None, gui_enabled: bool = True):
     from qgis.core import QgsApplication
-
-    QgsApplication.setPrefixPath(real_prefix, True)
+    QgsApplication.setPrefixPath(str(QGIS_DIR), True)
     app = QgsApplication([], gui_enabled)
     app.initQgis()
     return app
@@ -85,7 +59,6 @@ def init_processing() -> None:
 
     Processing.initialize()
     registry = QgsApplication.processingRegistry()
-
     if registry.providerById("native") is None:
         registry.addProvider(QgsNativeAlgorithms())
 

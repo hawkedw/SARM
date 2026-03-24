@@ -1,8 +1,7 @@
 {
-  "qgis_prefix_path": "E:/Distributive Soft/NextGIS",
-  "input_gdb_path": "F:/Work/SWARM/InputTopo.gdb",
-  "input_raster_folder": "F:/Work/Ukr/rasters",
-  "output_root": "F:/Work/SWARM/json",
+  "input_gdb_path": "F:/SARM/InputTopo.gdb",
+  "input_raster_folder": "F:/SARM/rastr",
+  "output_root": "F:/SARM/output",
   "route_layer_name": "RouteLines",
   "route_name_field": "name",
   "default_buffer_m": 500.0,
