@@ -138,7 +138,6 @@ class MainWindow(QMainWindow):
         self.preview_layers = []
         self._basemap_layer_id = None
         self._route_layer: QgsVectorLayer | None = None
-        self._editing = False
         self._digitize_tool = None
 
         self._build_ui()
@@ -164,6 +163,7 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(4, 4, 4, 4)
         root_layout.addWidget(main_splitter)
 
+        # --- Левая панель ---
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 4, 0)
 
@@ -213,6 +213,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.info_label)
         left_layout.addWidget(self.report_text, 1)
 
+        # --- Правая панель ---
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -228,32 +229,28 @@ class MainWindow(QMainWindow):
 
         # Тулбар редактирования RouteLines
         edit_bar = QHBoxLayout()
-        self.btn_edit_toggle = QPushButton("✒ Редактировать")
-        self.btn_edit_toggle.setCheckable(True)
-        self.btn_edit_toggle.setEnabled(False)
-        self.btn_edit_toggle.clicked.connect(self._toggle_edit)
         self.btn_new_line = QPushButton("⊕ Новая линия")
         self.btn_new_line.clicked.connect(self._start_digitize)
+        self.btn_new_line.setEnabled(False)
         self.btn_vertex_edit = QPushButton("▦ Вершины")
         self.btn_vertex_edit.clicked.connect(self._start_vertex_edit)
+        self.btn_vertex_edit.setEnabled(False)
         self.btn_delete = QPushButton("✘ Удалить")
         self.btn_delete.clicked.connect(self._delete_selected)
+        self.btn_delete.setEnabled(False)
         self.btn_save = QPushButton("💾 Сохранить")
         self.btn_save.clicked.connect(self._save_edits)
-        self.btn_cancel = QPushButton("✕ Отменить")
-        self.btn_cancel.clicked.connect(self._cancel_edits)
+        self.btn_save.setEnabled(False)
+        self.btn_cancel_edit = QPushButton("↺ Отменить всё")
+        self.btn_cancel_edit.clicked.connect(self._cancel_edits)
+        self.btn_cancel_edit.setEnabled(False)
 
-        for btn in (self.btn_new_line, self.btn_vertex_edit, self.btn_delete,
-                    self.btn_save, self.btn_cancel):
-            btn.setEnabled(False)
-
-        edit_bar.addWidget(self.btn_edit_toggle)
         edit_bar.addWidget(self.btn_new_line)
         edit_bar.addWidget(self.btn_vertex_edit)
         edit_bar.addWidget(self.btn_delete)
         edit_bar.addStretch()
         edit_bar.addWidget(self.btn_save)
-        edit_bar.addWidget(self.btn_cancel)
+        edit_bar.addWidget(self.btn_cancel_edit)
         right_layout.addLayout(edit_bar)
 
         map_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -284,53 +281,28 @@ class MainWindow(QMainWindow):
         self.canvas.setMapTool(self._pan_tool)
         self.canvas.setWheelFactor(2.0)
 
-        # CAD dock нужен для QgsMapToolDigitizeFeature
+        # CAD dock нужен для QgsMapToolDigitizeFeature, не отображается
         self._cad_dock = QgsAdvancedDigitizingDockWidget(self.canvas)
 
     # ------------------------------------------------------------------
     # Редактирование RouteLines
     # ------------------------------------------------------------------
-    def _toggle_edit(self, checked: bool):
-        if self._route_layer is None:
-            self.btn_edit_toggle.setChecked(False)
-            return
-        if checked:
-            self._route_layer.startEditing()
-            self._editing = True
-            self.btn_edit_toggle.setText("🔒 Завершить редактирование")
-            for btn in (self.btn_new_line, self.btn_vertex_edit, self.btn_delete,
-                        self.btn_save, self.btn_cancel):
-                btn.setEnabled(True)
-        else:
-            if self._route_layer.isModified():
-                reply = QMessageBox.question(
-                    self, "Сохранить?",
-                    "Есть несохранённые изменения. Сохранить?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                )
-                if reply == QMessageBox.StandardButton.Yes:
-                    self._save_edits()
-                else:
-                    self._cancel_edits()
-            else:
-                self._stop_editing()
-
-    def _stop_editing(self):
-        self._editing = False
-        self.btn_edit_toggle.setText("✒ Редактировать")
-        self.btn_edit_toggle.setChecked(False)
+    def _enable_edit_toolbar(self):
+        """Activates toolbar buttons after GDB load."""
         for btn in (self.btn_new_line, self.btn_vertex_edit, self.btn_delete,
-                    self.btn_save, self.btn_cancel):
-            btn.setEnabled(False)
-        self.canvas.setMapTool(self._pan_tool)
+                    self.btn_save, self.btn_cancel_edit):
+            btn.setEnabled(True)
 
     def _start_digitize(self):
         if self._route_layer is None:
             return
+        # Убедиться что слой в режиме редактирования
+        if not self._route_layer.isEditable():
+            self._route_layer.startEditing()
         tool = QgsMapToolDigitizeFeature(self.canvas, self._cad_dock)
         tool.setLayer(self._route_layer)
         tool.digitizingCompleted.connect(self._on_digitize_completed)
-        self._digitize_tool = tool  # удерживаем ссылку
+        self._digitize_tool = tool
         self.canvas.setMapTool(tool)
         self.info_label.setText("Кликайте для добавления вершин. Двойной клик — завершить.")
 
@@ -339,6 +311,7 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             self.info_label.setText("Создание отменено.")
             self.canvas.setMapTool(self._pan_tool)
+            self._digitize_tool = None
             return
         name = dlg.route_name()
         feature[self.config["route_name_field"]] = name
@@ -351,6 +324,8 @@ class MainWindow(QMainWindow):
     def _start_vertex_edit(self):
         if self._route_layer is None:
             return
+        if not self._route_layer.isEditable():
+            self._route_layer.startEditing()
         tool = QgsMapToolEdit(self.canvas)
         self.canvas.setMapTool(tool)
         self.info_label.setText("Кликните на линию и перетащивайте вершины.")
@@ -370,7 +345,8 @@ class MainWindow(QMainWindow):
         if self._route_layer is None:
             return
         self._route_layer.commitChanges()
-        self._stop_editing()
+        self._route_layer.startEditing()  # остаёмся в режиме редактирования
+        self.canvas.setMapTool(self._pan_tool)
         self._refresh_route_combo()
         self.info_label.setText("Изменения сохранены.")
 
@@ -378,7 +354,8 @@ class MainWindow(QMainWindow):
         if self._route_layer is None:
             return
         self._route_layer.rollBack()
-        self._stop_editing()
+        self._route_layer.startEditing()  # остаёмся в режиме редактирования
+        self.canvas.setMapTool(self._pan_tool)
         self.canvas.refresh()
         self.info_label.setText("Изменения отменены.")
 
@@ -502,8 +479,8 @@ class MainWindow(QMainWindow):
         return count
 
     def clear_project(self):
-        if self._editing:
-            self._cancel_edits()
+        if self._route_layer and self._route_layer.isEditable():
+            self._route_layer.rollBack()
         self.project.removeAllMapLayers()
         self._basemap_layer_id = None
         self._route_layer = None
@@ -511,7 +488,9 @@ class MainWindow(QMainWindow):
         self.route_combo.clear()
         self.route_rows = []
         self.report_text.clear()
-        self.btn_edit_toggle.setEnabled(False)
+        for btn in (self.btn_new_line, self.btn_vertex_edit, self.btn_delete,
+                    self.btn_save, self.btn_cancel_edit):
+            btn.setEnabled(False)
         idx = self.basemap_combo.currentIndex()
         if idx > 0:
             self._switch_basemap(idx)
@@ -561,7 +540,8 @@ class MainWindow(QMainWindow):
                 raise RuntimeError("Не удалось загрузить %s" % route_layer_name)
 
             self._route_layer = route_layer
-            self.btn_edit_toggle.setEnabled(True)
+            self._route_layer.startEditing()
+            self._enable_edit_toolbar()
 
             self.route_rows = get_route_choices(route_layer, route_name_field)
             for row in self.route_rows:
