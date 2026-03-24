@@ -60,16 +60,11 @@ from qgis.gui import (
     QgsLayerTreeMapCanvasBridge,
     QgsLayerTreeView,
     QgsMapCanvas,
-    QgsMapToolEdit,
     QgsMapToolPan,
     QgsRubberBand,
     QgsMapTool,
+    QgsVertexMarker,
 )
-
-try:
-    from qgis.gui import QgsVertexTool as _QgsVertexTool
-except ImportError:
-    _QgsVertexTool = None
 
 from gdb_reader import (
     get_route_choices,
@@ -99,6 +94,7 @@ _GEOM_ORDER = {
 
 RENDER_POINTS = QgsUnitTypes.RenderUnit.RenderPoints
 SELECT_TOLERANCE_PX = 8
+VERTEX_SNAP_PX = 12  # пиксельный радиус притяжки вершины
 
 
 def _apply_route_lines_style(layer: QgsVectorLayer):
@@ -115,11 +111,138 @@ def _apply_route_lines_style(layer: QgsVectorLayer):
     layer.setRenderer(QgsSingleSymbolRenderer(symbol))
 
 
-def _make_vertex_tool(canvas: QgsMapCanvas) -> QgsMapTool:
-    """Return best available vertex editing tool."""
-    if _QgsVertexTool is not None:
-        return _QgsVertexTool(canvas, _QgsVertexTool.AllLayers)
-    return QgsMapToolEdit(canvas)
+class VertexEditTool(QgsMapTool):
+    """
+    Редактор вершин, похожий на ArcGIS Pro:
+    - Наведение — подсветка ближайшей вершины (синий квадрат)
+    - Зажать и тащить — перемещение вершины с превью резинки
+    - Отпустить — записать новую позицию вершины в слой
+    """
+
+    def __init__(self, canvas: QgsMapCanvas, layer: QgsVectorLayer, fids: list):
+        super().__init__(canvas)
+        self._layer = layer
+        self._fids = fids  # редактируемые объекты
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+        # Маркер подсветки (hover)
+        self._hover_marker = QgsVertexMarker(canvas)
+        self._hover_marker.setColor(QColor(0, 0, 255))
+        self._hover_marker.setFillColor(QColor(0, 0, 255, 80))
+        self._hover_marker.setIconType(QgsVertexMarker.IconType.ICON_BOX)
+        self._hover_marker.setIconSize(10)
+        self._hover_marker.setVisible(False)
+
+        # Резинка для превью перетащивания
+        self._drag_rb = QgsRubberBand(canvas, QgsWkbTypes.GeometryType.PointGeometry)
+        self._drag_rb.setColor(QColor(255, 0, 0, 200))
+        self._drag_rb.setIconSize(8)
+
+        self._dragging = False
+        self._drag_fid = None
+        self._drag_vertex_idx = None
+        self._snap_pt: QgsPointXY | None = None  # текущая снэп-вершина (canvas CRS)
+
+    def _canvas_to_layer(self, pt: QgsPointXY) -> QgsPointXY:
+        canvas_crs = self.canvas().mapSettings().destinationCrs()
+        layer_crs = self._layer.crs()
+        if canvas_crs == layer_crs:
+            return pt
+        tr = QgsCoordinateTransform(canvas_crs, layer_crs, QgsProject.instance())
+        return tr.transform(pt)
+
+    def _layer_to_canvas(self, pt: QgsPointXY) -> QgsPointXY:
+        canvas_crs = self.canvas().mapSettings().destinationCrs()
+        layer_crs = self._layer.crs()
+        if canvas_crs == layer_crs:
+            return pt
+        tr = QgsCoordinateTransform(layer_crs, canvas_crs, QgsProject.instance())
+        return tr.transform(pt)
+
+    def _find_nearest_vertex(self, canvas_pt: QgsPointXY):
+        """Возвращает (fid, vertex_idx, canvas_pt) или None."""
+        tol = VERTEX_SNAP_PX * self.canvas().mapUnitsPerPixel()
+        best = None
+        best_dist = tol
+        for fid in self._fids:
+            feat = self._layer.getFeature(fid)
+            if not feat.isValid():
+                continue
+            geom = feat.geometry()
+            verts = geom.vertices()
+            idx = 0
+            for v in verts:
+                vpt_layer = QgsPointXY(v.x(), v.y())
+                vpt_canvas = self._layer_to_canvas(vpt_layer)
+                dist = canvas_pt.distance(vpt_canvas)
+                if dist < best_dist:
+                    best_dist = dist
+                    best = (fid, idx, vpt_canvas)
+                idx += 1
+        return best
+
+    def canvasMoveEvent(self, e):
+        pt = self.toMapCoordinates(e.pos())
+        if self._dragging and self._drag_fid is not None:
+            # Превью перемещения
+            self._drag_rb.reset(QgsWkbTypes.GeometryType.PointGeometry)
+            self._drag_rb.addPoint(pt)
+            self._hover_marker.setCenter(pt)
+            return
+        # Hover: ищем ближайшую вершину
+        result = self._find_nearest_vertex(pt)
+        if result:
+            _, _, vpt_canvas = result
+            self._snap_pt = vpt_canvas
+            self._hover_marker.setCenter(vpt_canvas)
+            self._hover_marker.setVisible(True)
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self._snap_pt = None
+            self._hover_marker.setVisible(False)
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def canvasPressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        pt = self.toMapCoordinates(e.pos())
+        result = self._find_nearest_vertex(pt)
+        if result:
+            fid, idx, vpt_canvas = result
+            self._dragging = True
+            self._drag_fid = fid
+            self._drag_vertex_idx = idx
+            self._drag_rb.reset(QgsWkbTypes.GeometryType.PointGeometry)
+            self._drag_rb.addPoint(vpt_canvas)
+
+    def canvasReleaseEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton or not self._dragging:
+            return
+        new_pt_canvas = self.toMapCoordinates(e.pos())
+        new_pt_layer = self._canvas_to_layer(new_pt_canvas)
+        # Применяем изменение к геометрии
+        feat = self._layer.getFeature(self._drag_fid)
+        geom = QgsGeometry(feat.geometry())  # копия
+        geom.moveVertex(new_pt_layer.x(), new_pt_layer.y(), self._drag_vertex_idx)
+        self._layer.changeGeometry(self._drag_fid, geom)
+        self.canvas().refresh()
+        # Сброс
+        self._dragging = False
+        self._drag_fid = None
+        self._drag_vertex_idx = None
+        self._drag_rb.reset(QgsWkbTypes.GeometryType.PointGeometry)
+        self._hover_marker.setVisible(False)
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self._dragging = False
+            self._drag_rb.reset(QgsWkbTypes.GeometryType.PointGeometry)
+            self._hover_marker.setVisible(False)
+
+    def deactivate(self):
+        self._drag_rb.reset(QgsWkbTypes.GeometryType.PointGeometry)
+        self._hover_marker.setVisible(False)
+        super().deactivate()
 
 
 class SelectLineTool(QgsMapTool):
@@ -233,7 +356,7 @@ class MainWindow(QMainWindow):
         self._basemap_layer_id = None
         self._route_layer: QgsVectorLayer | None = None
         self._draw_tool: LineDrawTool | None = None
-        self._vertex_tool = None
+        self._vertex_tool: VertexEditTool | None = None
 
         self._build_ui()
         self._load_config_into_ui()
@@ -337,9 +460,12 @@ class MainWindow(QMainWindow):
         self.btn_new_line.clicked.connect(self._start_draw)
         self.btn_new_line.setEnabled(False)
 
-        # Чекбокс для режима редактирования вершин
         self.chk_vertex_edit = QCheckBox("Вершины")
-        self.chk_vertex_edit.setToolTip("Режим редактирования вершин выбранной линии")
+        self.chk_vertex_edit.setToolTip(
+            "Режим редактирования вершин.\n"
+            "Наведите на вершину — подсветится.\n"
+            "Зажмите и перетащите — переместите."
+        )
         self.chk_vertex_edit.setEnabled(False)
         self.chk_vertex_edit.stateChanged.connect(self._on_vertex_edit_toggled)
 
@@ -448,9 +574,13 @@ class MainWindow(QMainWindow):
                 self.chk_vertex_edit.blockSignals(False)
                 self.info_label.setText("Сначала выберите линию.")
                 return
-            self._vertex_tool = _make_vertex_tool(self.canvas)
+            fids = list(self._route_layer.selectedFeatureIds())
+            self._vertex_tool = VertexEditTool(self.canvas, self._route_layer, fids)
             self.canvas.setMapTool(self._vertex_tool)
-            self.info_label.setText("Режим вершин: перетащивайте вершины. Снимите галочку чтобы выйти.")
+            self.info_label.setText(
+                "Режим вершин: наведите на вершину (подсветится), зажмите и перетащите. "
+                "Потом ‘💾 Сохранить’."
+            )
         else:
             self._vertex_tool = None
             self.canvas.setMapTool(self._pan_tool)
