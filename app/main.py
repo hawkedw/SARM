@@ -41,6 +41,7 @@ from qgis.PyQt.QtWidgets import (
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
+    QgsDistanceArea,
     QgsFeature,
     QgsGeometry,
     QgsLayerTreeLayer,
@@ -94,7 +95,7 @@ _GEOM_ORDER = {
 
 RENDER_POINTS = QgsUnitTypes.RenderUnit.RenderPoints
 SELECT_TOLERANCE_PX = 8
-VERTEX_SNAP_PX = 12  # пиксельный радиус притяжки вершины
+VERTEX_SNAP_PX = 12
 
 
 def _apply_route_lines_style(layer: QgsVectorLayer):
@@ -112,20 +113,12 @@ def _apply_route_lines_style(layer: QgsVectorLayer):
 
 
 class VertexEditTool(QgsMapTool):
-    """
-    Редактор вершин, похожий на ArcGIS Pro:
-    - Наведение — подсветка ближайшей вершины (синий квадрат)
-    - Зажать и тащить — перемещение вершины с превью резинки
-    - Отпустить — записать новую позицию вершины в слой
-    """
-
     def __init__(self, canvas: QgsMapCanvas, layer: QgsVectorLayer, fids: list):
         super().__init__(canvas)
         self._layer = layer
-        self._fids = fids  # редактируемые объекты
+        self._fids = fids
         self.setCursor(Qt.CursorShape.ArrowCursor)
 
-        # Маркер подсветки (hover)
         self._hover_marker = QgsVertexMarker(canvas)
         self._hover_marker.setColor(QColor(0, 0, 255))
         self._hover_marker.setFillColor(QColor(0, 0, 255, 80))
@@ -133,7 +126,6 @@ class VertexEditTool(QgsMapTool):
         self._hover_marker.setIconSize(10)
         self._hover_marker.setVisible(False)
 
-        # Резинка для превью перетащивания
         self._drag_rb = QgsRubberBand(canvas, QgsWkbTypes.GeometryType.PointGeometry)
         self._drag_rb.setColor(QColor(255, 0, 0, 200))
         self._drag_rb.setIconSize(8)
@@ -141,26 +133,22 @@ class VertexEditTool(QgsMapTool):
         self._dragging = False
         self._drag_fid = None
         self._drag_vertex_idx = None
-        self._snap_pt: QgsPointXY | None = None  # текущая снэп-вершина (canvas CRS)
 
-    def _canvas_to_layer(self, pt: QgsPointXY) -> QgsPointXY:
+    def _canvas_to_layer(self, pt):
         canvas_crs = self.canvas().mapSettings().destinationCrs()
         layer_crs = self._layer.crs()
         if canvas_crs == layer_crs:
             return pt
-        tr = QgsCoordinateTransform(canvas_crs, layer_crs, QgsProject.instance())
-        return tr.transform(pt)
+        return QgsCoordinateTransform(canvas_crs, layer_crs, QgsProject.instance()).transform(pt)
 
-    def _layer_to_canvas(self, pt: QgsPointXY) -> QgsPointXY:
+    def _layer_to_canvas(self, pt):
         canvas_crs = self.canvas().mapSettings().destinationCrs()
         layer_crs = self._layer.crs()
         if canvas_crs == layer_crs:
             return pt
-        tr = QgsCoordinateTransform(layer_crs, canvas_crs, QgsProject.instance())
-        return tr.transform(pt)
+        return QgsCoordinateTransform(layer_crs, canvas_crs, QgsProject.instance()).transform(pt)
 
-    def _find_nearest_vertex(self, canvas_pt: QgsPointXY):
-        """Возвращает (fid, vertex_idx, canvas_pt) или None."""
+    def _find_nearest_vertex(self, canvas_pt):
         tol = VERTEX_SNAP_PX * self.canvas().mapUnitsPerPixel()
         best = None
         best_dist = tol
@@ -168,65 +156,51 @@ class VertexEditTool(QgsMapTool):
             feat = self._layer.getFeature(fid)
             if not feat.isValid():
                 continue
-            geom = feat.geometry()
-            verts = geom.vertices()
             idx = 0
-            for v in verts:
-                vpt_layer = QgsPointXY(v.x(), v.y())
-                vpt_canvas = self._layer_to_canvas(vpt_layer)
-                dist = canvas_pt.distance(vpt_canvas)
+            for v in feat.geometry().vertices():
+                vpt = self._layer_to_canvas(QgsPointXY(v.x(), v.y()))
+                dist = canvas_pt.distance(vpt)
                 if dist < best_dist:
                     best_dist = dist
-                    best = (fid, idx, vpt_canvas)
+                    best = (fid, idx, vpt)
                 idx += 1
         return best
 
     def canvasMoveEvent(self, e):
         pt = self.toMapCoordinates(e.pos())
-        if self._dragging and self._drag_fid is not None:
-            # Превью перемещения
+        if self._dragging:
             self._drag_rb.reset(QgsWkbTypes.GeometryType.PointGeometry)
             self._drag_rb.addPoint(pt)
             self._hover_marker.setCenter(pt)
             return
-        # Hover: ищем ближайшую вершину
         result = self._find_nearest_vertex(pt)
         if result:
-            _, _, vpt_canvas = result
-            self._snap_pt = vpt_canvas
-            self._hover_marker.setCenter(vpt_canvas)
+            self._hover_marker.setCenter(result[2])
             self._hover_marker.setVisible(True)
             self.setCursor(Qt.CursorShape.CrossCursor)
         else:
-            self._snap_pt = None
             self._hover_marker.setVisible(False)
             self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def canvasPressEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton:
             return
-        pt = self.toMapCoordinates(e.pos())
-        result = self._find_nearest_vertex(pt)
+        result = self._find_nearest_vertex(self.toMapCoordinates(e.pos()))
         if result:
-            fid, idx, vpt_canvas = result
             self._dragging = True
-            self._drag_fid = fid
-            self._drag_vertex_idx = idx
+            self._drag_fid, self._drag_vertex_idx, vpt = result
             self._drag_rb.reset(QgsWkbTypes.GeometryType.PointGeometry)
-            self._drag_rb.addPoint(vpt_canvas)
+            self._drag_rb.addPoint(vpt)
 
     def canvasReleaseEvent(self, e):
         if e.button() != Qt.MouseButton.LeftButton or not self._dragging:
             return
-        new_pt_canvas = self.toMapCoordinates(e.pos())
-        new_pt_layer = self._canvas_to_layer(new_pt_canvas)
-        # Применяем изменение к геометрии
+        new_pt = self._canvas_to_layer(self.toMapCoordinates(e.pos()))
         feat = self._layer.getFeature(self._drag_fid)
-        geom = QgsGeometry(feat.geometry())  # копия
-        geom.moveVertex(new_pt_layer.x(), new_pt_layer.y(), self._drag_vertex_idx)
+        geom = QgsGeometry(feat.geometry())
+        geom.moveVertex(new_pt.x(), new_pt.y(), self._drag_vertex_idx)
         self._layer.changeGeometry(self._drag_fid, geom)
         self.canvas().refresh()
-        # Сброс
         self._dragging = False
         self._drag_fid = None
         self._drag_vertex_idx = None
@@ -248,7 +222,7 @@ class VertexEditTool(QgsMapTool):
 class SelectLineTool(QgsMapTool):
     selectionChanged = pyqtSignal()
 
-    def __init__(self, canvas: QgsMapCanvas, route_layer: QgsVectorLayer):
+    def __init__(self, canvas, route_layer):
         super().__init__(canvas)
         self._layer = route_layer
         self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -262,8 +236,7 @@ class SelectLineTool(QgsMapTool):
         canvas_crs = self.canvas().mapSettings().destinationCrs()
         layer_crs = self._layer.crs()
         if canvas_crs != layer_crs:
-            tr = QgsCoordinateTransform(canvas_crs, layer_crs, QgsProject.instance())
-            rect = tr.transformBoundingBox(rect)
+            rect = QgsCoordinateTransform(canvas_crs, layer_crs, QgsProject.instance()).transformBoundingBox(rect)
         self._layer.selectByRect(rect, QgsVectorLayer.SelectBehavior.SetSelection)
         self.selectionChanged.emit()
 
@@ -271,9 +244,9 @@ class SelectLineTool(QgsMapTool):
 class LineDrawTool(QgsMapTool):
     lineFinished = pyqtSignal(list)
 
-    def __init__(self, canvas: QgsMapCanvas):
+    def __init__(self, canvas):
         super().__init__(canvas)
-        self._points: list[QgsPointXY] = []
+        self._points = []
         self._rb = QgsRubberBand(canvas, QgsWkbTypes.GeometryType.LineGeometry)
         self._rb.setColor(QColor(255, 0, 0, 200))
         self._rb.setWidth(2)
@@ -336,7 +309,7 @@ class RouteNameDialog(QDialog):
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
-    def route_name(self) -> str:
+    def route_name(self):
         return self.name_edit.text().strip()
 
 
@@ -355,8 +328,9 @@ class MainWindow(QMainWindow):
         self.preview_layers = []
         self._basemap_layer_id = None
         self._route_layer: QgsVectorLayer | None = None
-        self._draw_tool: LineDrawTool | None = None
-        self._vertex_tool: VertexEditTool | None = None
+        self._draw_tool = None
+        self._vertex_tool = None
+        self._buffer_rb: QgsRubberBand | None = None  # резинка буфера
 
         self._build_ui()
         self._load_config_into_ui()
@@ -364,6 +338,7 @@ class MainWindow(QMainWindow):
         self.canvas.setDestinationCrs(CRS_3857)
         QTimer.singleShot(200, lambda: self.basemap_combo.setCurrentIndex(1))
 
+    # ------------------------------------------------------------------
     def _build_ui(self):
         root = QWidget()
         self.setCentralWidget(root)
@@ -407,9 +382,11 @@ class MainWindow(QMainWindow):
         self.buffer_spin.setRange(1, 1000000)
         self.buffer_spin.setDecimals(2)
         self.buffer_spin.setSuffix(" m")
+        self.buffer_spin.valueChanged.connect(self._on_buffer_changed)
         form.addRow("Buffer", self.buffer_spin)
 
         self.route_combo = QComboBox()
+        self.route_combo.currentIndexChanged.connect(self._on_route_combo_changed)
         form.addRow("Route", self.route_combo)
 
         self.load_btn = QPushButton("Load GDB")
@@ -446,17 +423,14 @@ class MainWindow(QMainWindow):
         edit_bar = QHBoxLayout()
 
         self.btn_pan = QPushButton("🖐 Навигация")
-        self.btn_pan.setToolTip("Перемещение по карте")
         self.btn_pan.clicked.connect(self._activate_pan)
         self.btn_pan.setEnabled(False)
 
         self.btn_select = QPushButton("→ Выборка")
-        self.btn_select.setToolTip("Выбрать линию маршрута для редактирования")
         self.btn_select.clicked.connect(self._activate_select)
         self.btn_select.setEnabled(False)
 
         self.btn_new_line = QPushButton("⊕ Новая линия")
-        self.btn_new_line.setToolTip("Нарисовать новый маршрут")
         self.btn_new_line.clicked.connect(self._start_draw)
         self.btn_new_line.setEnabled(False)
 
@@ -470,7 +444,6 @@ class MainWindow(QMainWindow):
         self.chk_vertex_edit.stateChanged.connect(self._on_vertex_edit_toggled)
 
         self.btn_delete = QPushButton("✘ Удалить")
-        self.btn_delete.setToolTip("Удалить выбранную линию")
         self.btn_delete.clicked.connect(self._delete_selected)
         self.btn_delete.setEnabled(False)
 
@@ -519,6 +492,78 @@ class MainWindow(QMainWindow):
         self._pan_tool = QgsMapToolPan(self.canvas)
         self.canvas.setMapTool(self._pan_tool)
         self.canvas.setWheelFactor(2.0)
+
+    # ------------------------------------------------------------------
+    # Буфер
+    # ------------------------------------------------------------------
+    def _clear_buffer_rb(self):
+        if self._buffer_rb is not None:
+            self._buffer_rb.reset(QgsWkbTypes.GeometryType.PolygonGeometry)
+            self._buffer_rb = None
+
+    def _draw_buffer(self, fid: int):
+        """Build buffer in metres in EPSG:3857 and draw as rubber band."""
+        self._clear_buffer_rb()
+        if self._route_layer is None:
+            return
+        feat = self._route_layer.getFeature(fid)
+        if not feat.isValid():
+            return
+
+        # Преобразуем геометрию в 3857 (метры)
+        layer_crs = self._route_layer.crs()
+        tr = QgsCoordinateTransform(layer_crs, CRS_3857, self.project)
+        geom_3857 = QgsGeometry(feat.geometry())
+        geom_3857.transform(tr)
+
+        buf_m = self.buffer_spin.value()
+        buf_geom = geom_3857.buffer(buf_m, 32)  # 32 сегмента дуги
+
+        rb = QgsRubberBand(self.canvas, QgsWkbTypes.GeometryType.PolygonGeometry)
+        rb.setColor(QColor(30, 120, 255, 60))       # полупрозрачная заливка
+        rb.setStrokeColor(QColor(30, 120, 255, 180))  # контур
+        rb.setWidth(2)
+        rb.setToGeometry(buf_geom, None)  # геометрия уже в CRS канваса
+        self._buffer_rb = rb
+
+    def _on_buffer_changed(self, _value):
+        fid = self.route_combo.currentData()
+        if fid is not None:
+            self._draw_buffer(fid)
+
+    # ------------------------------------------------------------------
+    # Route combo
+    # ------------------------------------------------------------------
+    def _on_route_combo_changed(self, index):
+        if self._route_layer is None:
+            return
+        fid = self.route_combo.currentData()
+        if fid is None:
+            # заглушка "— выберите —"
+            self._route_layer.removeSelection()
+            self._clear_buffer_rb()
+            self.canvas.refresh()
+            return
+
+        # Выбрать фичер
+        self._route_layer.selectByIds([fid])
+
+        # Zoom to extent с паддингом
+        feat = self._route_layer.getFeature(fid)
+        if feat.isValid():
+            layer_crs = self._route_layer.crs()
+            tr = QgsCoordinateTransform(layer_crs, CRS_3857, self.project)
+            geom_3857 = QgsGeometry(feat.geometry())
+            geom_3857.transform(tr)
+            bbox = geom_3857.boundingBox()
+            # паддинг = буфер + 20%
+            pad = self.buffer_spin.value() * 1.2
+            bbox.grow(max(pad, bbox.width() * 0.1, bbox.height() * 0.1))
+            self.canvas.setExtent(bbox)
+
+        # Отрисовать буфер
+        self._draw_buffer(fid)
+        self.canvas.refresh()
 
     # ------------------------------------------------------------------
     def _enable_edit_toolbar(self):
@@ -636,6 +681,7 @@ class MainWindow(QMainWindow):
             self.info_label.setText("Сначала выберите линию.")
             return
         self._reset_vertex_edit()
+        self._clear_buffer_rb()
         self._route_layer.deleteFeatures(list(selected))
         self.canvas.refresh()
         self._update_selection_buttons()
@@ -650,6 +696,10 @@ class MainWindow(QMainWindow):
         self.canvas.setMapTool(self._pan_tool)
         self._update_selection_buttons()
         self._refresh_route_combo()
+        # Перерисовать буфер если маршрут выбран
+        fid = self.route_combo.currentData()
+        if fid is not None:
+            self._draw_buffer(fid)
         self.info_label.setText("Изменения сохранены.")
 
     def _cancel_edits(self):
@@ -661,22 +711,30 @@ class MainWindow(QMainWindow):
         self.canvas.setMapTool(self._pan_tool)
         self.canvas.refresh()
         self._update_selection_buttons()
+        fid = self.route_combo.currentData()
+        if fid is not None:
+            self._draw_buffer(fid)
         self.info_label.setText("Изменения отменены.")
 
     def _refresh_route_combo(self):
         if self._route_layer is None:
             return
         current_fid = self.route_combo.currentData()
+        self.route_combo.blockSignals(True)
         self.route_combo.clear()
+        self.route_combo.addItem("— выберите маршрут —", None)
         self.route_rows = get_route_choices(
             self._route_layer, self.config["route_name_field"]
         )
         for row in self.route_rows:
             self.route_combo.addItem(row["label"], row["fid"])
+        self.route_combo.blockSignals(False)
+        # Восстановить выбор
         for i in range(self.route_combo.count()):
             if self.route_combo.itemData(i) == current_fid:
                 self.route_combo.setCurrentIndex(i)
-                break
+                return
+        self.route_combo.setCurrentIndex(0)
 
     def _add_layer_ordered(self, layer, visible: bool = True):
         self.project.addMapLayer(layer, False)
@@ -781,11 +839,14 @@ class MainWindow(QMainWindow):
     def clear_project(self):
         if self._route_layer and self._route_layer.isEditable():
             self._route_layer.rollBack()
+        self._clear_buffer_rb()
         self.project.removeAllMapLayers()
         self._basemap_layer_id = None
         self._route_layer = None
         self.preview_layers = []
+        self.route_combo.blockSignals(True)
         self.route_combo.clear()
+        self.route_combo.blockSignals(False)
         self.route_rows = []
         self.report_text.clear()
         self._vertex_tool = None
@@ -836,14 +897,23 @@ class MainWindow(QMainWindow):
             self._route_layer = route_layer
             self._route_layer.startEditing()
             self._enable_edit_toolbar()
+
+            # Заполняем комбо: сначала заглушка, потом маршруты
+            self.route_combo.blockSignals(True)
+            self.route_combo.addItem("— выберите маршрут —", None)
             self.route_rows = get_route_choices(route_layer, route_name_field)
             for row in self.route_rows:
                 self.route_combo.addItem(row["label"], row["fid"])
+            self.route_combo.setCurrentIndex(0)
+            self.route_combo.blockSignals(False)
+
+            # Zoom на весь слой
             transform = QgsCoordinateTransform(route_layer.crs(), CRS_3857, self.project)
             extent_3857 = transform.transformBoundingBox(route_layer.extent())
             extent_3857.grow(extent_3857.width() * 0.1)
             self.canvas.setExtent(extent_3857)
             self.canvas.refresh()
+
             self.info_label.setText(
                 "Загружено: vectors=%d, rasters_gdb=%d, rasters_folder=%d, routes=%d"
                 % (len(vector_names), len(raster_items), folder_raster_count, len(self.route_rows))
