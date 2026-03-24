@@ -18,6 +18,7 @@ QGS_APP = init_qgis(gui_enabled=True)
 init_processing()
 
 from qgis.PyQt.QtCore import Qt, QTimer
+from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -158,7 +159,7 @@ class MainWindow(QMainWindow):
         basemap_row.addStretch()
 
         self.canvas = QgsMapCanvas()
-        self.canvas.setCanvasColor(Qt.white)
+        self.canvas.setCanvasColor(QColor(255, 255, 255))
         self.canvas.enableAntiAliasing(True)
 
         self.bridge = QgsLayerTreeMapCanvasBridge(
