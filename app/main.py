@@ -39,6 +39,7 @@ from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsLayerTreeLayer,
+    QgsLayerTreeModel,
     QgsProject,
     QgsRasterLayer,
 )
@@ -94,7 +95,6 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
 
-        # Главный сплиттер: левая панель + правая
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
         left = QWidget()
         right = QWidget()
@@ -108,7 +108,6 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(4, 4, 4, 4)
         root_layout.addWidget(main_splitter)
 
-        # --- Левая панель: форма + кнопки + лог ---
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 4, 0)
 
@@ -161,7 +160,6 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.info_label)
         left_layout.addWidget(self.report_text, 1)
 
-        # --- Правая панель: верхняя строка (basemap) + верт. сплиттер (tree + canvas) ---
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -175,15 +173,27 @@ class MainWindow(QMainWindow):
         basemap_row.addStretch()
         right_layout.addLayout(basemap_row)
 
-        # Сплиттер: список слоёв | канвас
         map_splitter = QSplitter(Qt.Orientation.Horizontal)
-
-        self.layer_tree_view = QgsLayerTreeView()
-        self.layer_tree_view.setMinimumWidth(180)
 
         self.canvas = QgsMapCanvas()
         self.canvas.setCanvasColor(QColor(255, 255, 255))
         self.canvas.enableAntiAliasing(True)
+
+        # Bridge до создания tree view
+        self.bridge = QgsLayerTreeMapCanvasBridge(
+            self.project.layerTreeRoot(),
+            self.canvas
+        )
+
+        # QgsLayerTreeModel связывает tree root с view
+        self._layer_tree_model = QgsLayerTreeModel(self.project.layerTreeRoot())
+        self._layer_tree_model.setFlag(QgsLayerTreeModel.Flag.AllowNodeReorder)
+        self._layer_tree_model.setFlag(QgsLayerTreeModel.Flag.AllowNodeRename, False)
+        self._layer_tree_model.setFlag(QgsLayerTreeModel.Flag.AllowNodeChangeVisibility)
+
+        self.layer_tree_view = QgsLayerTreeView()
+        self.layer_tree_view.setModel(self._layer_tree_model)
+        self.layer_tree_view.setMinimumWidth(180)
 
         map_splitter.addWidget(self.layer_tree_view)
         map_splitter.addWidget(self.canvas)
@@ -192,16 +202,6 @@ class MainWindow(QMainWindow):
         map_splitter.setSizes([220, 1060])
 
         right_layout.addWidget(map_splitter, 1)
-
-        # Bridge связывает дерево слоёв с канвасом
-        self.bridge = QgsLayerTreeMapCanvasBridge(
-            self.project.layerTreeRoot(),
-            self.canvas
-        )
-        # Подключаем tree view к модели проекта
-        self.layer_tree_view.setModel(
-            self.project.layerTreeRoot().createModel()
-        )
 
     def _switch_basemap(self, index):
         if self._basemap_layer_id is not None:
@@ -268,12 +268,12 @@ class MainWindow(QMainWindow):
         if not folder.exists():
             return 0
         count = 0
+        root = self.project.layerTreeRoot()
         for f in sorted(folder.rglob("*")):
             if f.suffix.lower() in RASTER_EXTENSIONS:
                 layer = QgsRasterLayer(str(f), f.stem, "gdal")
                 if layer.isValid():
                     self.project.addMapLayer(layer, False)
-                    root = self.project.layerTreeRoot()
                     root.insertChildNode(-1, QgsLayerTreeLayer(layer))
                     self.preview_layers.append(layer)
                     count += 1
@@ -331,7 +331,6 @@ class MainWindow(QMainWindow):
                     except Exception:
                         pass
 
-            # Растры из папки
             folder_raster_count = 0
             if raster_folder:
                 folder_raster_count = self._load_rasters_from_folder(raster_folder)
