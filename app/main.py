@@ -49,6 +49,7 @@ from qgis.core import (
     QgsPointXY,
     QgsProject,
     QgsRasterLayer,
+    QgsRectangle,
     QgsSimpleLineSymbolLayer,
     QgsSingleSymbolRenderer,
     QgsUnitTypes,
@@ -61,6 +62,7 @@ from qgis.gui import (
     QgsMapCanvas,
     QgsMapToolEdit,
     QgsMapToolPan,
+    QgsMapToolVertexEdit,
     QgsRubberBand,
     QgsMapTool,
 )
@@ -92,6 +94,7 @@ _GEOM_ORDER = {
 }
 
 RENDER_POINTS = QgsUnitTypes.RenderUnit.RenderPoints
+SELECT_TOLERANCE_PX = 8  # пикселей от клика до линии
 
 
 def _apply_route_lines_style(layer: QgsVectorLayer):
@@ -108,13 +111,39 @@ def _apply_route_lines_style(layer: QgsVectorLayer):
     layer.setRenderer(QgsSingleSymbolRenderer(symbol))
 
 
+class SelectLineTool(QgsMapTool):
+    """Click — выбрать объект в route_layer в толерансе SELECT_TOLERANCE_PX px."""
+    selectionChanged = pyqtSignal()  # выборка изменилась
+
+    def __init__(self, canvas: QgsMapCanvas, route_layer: QgsVectorLayer):
+        super().__init__(canvas)
+        self._layer = route_layer
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def canvasPressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        pt = self.toMapCoordinates(e.pos())
+        # Переводим tolerance из px в единицы карты
+        tol = SELECT_TOLERANCE_PX * self.canvas().mapUnitsPerPixel()
+        rect = QgsRectangle(pt.x() - tol, pt.y() - tol, pt.x() + tol, pt.y() + tol)
+        # Преобразуем ректангл из CRS канваса в CRS слоя
+        canvas_crs = self.canvas().mapSettings().destinationCrs()
+        layer_crs = self._layer.crs()
+        if canvas_crs != layer_crs:
+            tr = QgsCoordinateTransform(canvas_crs, layer_crs, QgsProject.instance())
+            rect = tr.transformBoundingBox(rect)
+        self._layer.selectByRect(rect, QgsVectorLayer.SelectBehavior.SetSelection)
+        self.selectionChanged.emit()
+
+
 class LineDrawTool(QgsMapTool):
     """
     Left click  — добавить вершину немедленно.
-    Double click — отменить лишнюю вершину (добавленную первым press) и финишировать.
+    Double click — убрать последнюю вершину (от press) и финишировать.
     Esc         — отмена.
     """
-    lineFinished = pyqtSignal(list)  # list[QgsPointXY]
+    lineFinished = pyqtSignal(list)
 
     def __init__(self, canvas: QgsMapCanvas):
         super().__init__(canvas)
@@ -124,7 +153,6 @@ class LineDrawTool(QgsMapTool):
         self._rb.setWidth(2)
 
     def canvasPressEvent(self, e):
-        """Every press — add vertex immediately at exact click position."""
         if e.button() != Qt.MouseButton.LeftButton:
             return
         pt = self.toMapCoordinates(e.pos())
@@ -132,28 +160,19 @@ class LineDrawTool(QgsMapTool):
         self._rb.addPoint(pt)
 
     def canvasDoubleClickEvent(self, e):
-        """Double click: Qt already fired one press before this.
-        Remove that extra vertex, then finish."""
         if e.button() != Qt.MouseButton.LeftButton:
             return
-        # Убираем последнюю вершину — её добавил canvasPressEvent первого клика двойного
         if self._points:
             self._points.pop()
             self._rb.removeLastPoint()
         if len(self._points) >= 2:
             self._finish()
-        else:
-            self.info_too_few()
-
-    def info_too_few(self):
-        pass  # обрабатывается в MainWindow через сигнал
+        # если < 2 — молча, продолжаем рисовать
 
     def canvasMoveEvent(self, e):
-        """Rubber band preview — only the trailing segment follows cursor."""
         if not self._points:
             return
         pt = self.toMapCoordinates(e.pos())
-        # Если trailing-точка уже есть — двигаем её; иначе добавляем
         if self._rb.numberOfVertices() > len(self._points):
             self._rb.movePoint(pt)
         else:
@@ -299,22 +318,44 @@ class MainWindow(QMainWindow):
         right_layout.addLayout(basemap_row)
 
         edit_bar = QHBoxLayout()
+
+        # --- Инструменты навигации ---
+        self.btn_pan = QPushButton("🖐 Навигация")
+        self.btn_pan.setToolTip("Перемещение по карте")
+        self.btn_pan.clicked.connect(self._activate_pan)
+        self.btn_pan.setEnabled(False)
+
+        self.btn_select = QPushButton("→ Выборка")
+        self.btn_select.setToolTip("Выбрать линию маршрута для редактирования")
+        self.btn_select.clicked.connect(self._activate_select)
+        self.btn_select.setEnabled(False)
+
+        # --- Инструменты редактирования ---
         self.btn_new_line = QPushButton("⊕ Новая линия")
+        self.btn_new_line.setToolTip("Нарисовать новый маршрут")
         self.btn_new_line.clicked.connect(self._start_draw)
         self.btn_new_line.setEnabled(False)
+
         self.btn_vertex_edit = QPushButton("▦ Вершины")
+        self.btn_vertex_edit.setToolTip("Редактировать вершины выбранной линии")
         self.btn_vertex_edit.clicked.connect(self._start_vertex_edit)
         self.btn_vertex_edit.setEnabled(False)
+
         self.btn_delete = QPushButton("✘ Удалить")
+        self.btn_delete.setToolTip("Удалить выбранную линию")
         self.btn_delete.clicked.connect(self._delete_selected)
         self.btn_delete.setEnabled(False)
+
         self.btn_save = QPushButton("💾 Сохранить")
         self.btn_save.clicked.connect(self._save_edits)
         self.btn_save.setEnabled(False)
+
         self.btn_cancel_edit = QPushButton("↺ Отменить всё")
         self.btn_cancel_edit.clicked.connect(self._cancel_edits)
         self.btn_cancel_edit.setEnabled(False)
 
+        edit_bar.addWidget(self.btn_pan)
+        edit_bar.addWidget(self.btn_select)
         edit_bar.addWidget(self.btn_new_line)
         edit_bar.addWidget(self.btn_vertex_edit)
         edit_bar.addWidget(self.btn_delete)
@@ -353,13 +394,52 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def _enable_edit_toolbar(self):
-        for btn in (self.btn_new_line, self.btn_vertex_edit, self.btn_delete,
+        for btn in (self.btn_pan, self.btn_select, self.btn_new_line,
                     self.btn_save, self.btn_cancel_edit):
             btn.setEnabled(True)
+        # vertex/delete — только после выборки
+        self.btn_vertex_edit.setEnabled(False)
+        self.btn_delete.setEnabled(False)
 
+    def _activate_pan(self):
+        if self._route_layer:
+            self._route_layer.removeSelection()
+        self._update_selection_buttons()
+        self.canvas.setMapTool(self._pan_tool)
+        self.info_label.setText("Навигация по карте.")
+
+    def _activate_select(self):
+        if self._route_layer is None:
+            return
+        tool = SelectLineTool(self.canvas, self._route_layer)
+        tool.selectionChanged.connect(self._on_selection_changed)
+        self.canvas.setMapTool(tool)
+        self.info_label.setText("Кликните на линию маршрута для выборки.")
+
+    def _on_selection_changed(self):
+        if self._route_layer is None:
+            return
+        has_sel = self._route_layer.selectedFeatureCount() > 0
+        self.btn_vertex_edit.setEnabled(has_sel)
+        self.btn_delete.setEnabled(has_sel)
+        if has_sel:
+            names = [f[self.config["route_name_field"]] or "(no name)"
+                     for f in self._route_layer.selectedFeatures()]
+            self.info_label.setText("Выбрано: %s" % ", ".join(str(n) for n in names))
+        else:
+            self.info_label.setText("Ничего не выбрано.")
+
+    def _update_selection_buttons(self):
+        has_sel = bool(self._route_layer and self._route_layer.selectedFeatureCount() > 0)
+        self.btn_vertex_edit.setEnabled(has_sel)
+        self.btn_delete.setEnabled(has_sel)
+
+    # ------------------------------------------------------------------
     def _start_draw(self):
         if self._route_layer is None:
             return
+        if self._route_layer:
+            self._route_layer.removeSelection()
         tool = LineDrawTool(self.canvas)
         tool.lineFinished.connect(self._on_line_finished)
         self._draw_tool = tool
@@ -394,21 +474,26 @@ class MainWindow(QMainWindow):
         self.info_label.setText("Линия «%s» добавлена. Не забудьте сохранить." % name)
 
     def _start_vertex_edit(self):
-        if self._route_layer is None:
+        if self._route_layer is None or self._route_layer.selectedFeatureCount() == 0:
+            self.info_label.setText("Сначала выберите линию (кнопка ‘→ Выборка’).")
             return
-        tool = QgsMapToolEdit(self.canvas)
+        try:
+            tool = QgsMapToolVertexEdit(self.canvas)
+        except AttributeError:
+            tool = QgsMapToolEdit(self.canvas)
         self.canvas.setMapTool(tool)
-        self.info_label.setText("Кликните на линию и перетащивайте вершины.")
+        self.info_label.setText("Перетащивайте вершины. По завершении нажмите ‘💾 Сохранить’.")
 
     def _delete_selected(self):
         if self._route_layer is None:
             return
         selected = self._route_layer.selectedFeatureIds()
         if not selected:
-            self.info_label.setText("Сначала выберите линию кликом.")
+            self.info_label.setText("Сначала выберите линию.")
             return
         self._route_layer.deleteFeatures(list(selected))
         self.canvas.refresh()
+        self._update_selection_buttons()
         self.info_label.setText("Удалено %d объектов." % len(selected))
 
     def _save_edits(self):
@@ -417,6 +502,7 @@ class MainWindow(QMainWindow):
         self._route_layer.commitChanges()
         self._route_layer.startEditing()
         self.canvas.setMapTool(self._pan_tool)
+        self._update_selection_buttons()
         self._refresh_route_combo()
         self.info_label.setText("Изменения сохранены.")
 
@@ -427,6 +513,7 @@ class MainWindow(QMainWindow):
         self._route_layer.startEditing()
         self.canvas.setMapTool(self._pan_tool)
         self.canvas.refresh()
+        self._update_selection_buttons()
         self.info_label.setText("Изменения отменены.")
 
     def _refresh_route_combo(self):
@@ -557,7 +644,8 @@ class MainWindow(QMainWindow):
         self.route_combo.clear()
         self.route_rows = []
         self.report_text.clear()
-        for btn in (self.btn_new_line, self.btn_vertex_edit, self.btn_delete,
+        for btn in (self.btn_pan, self.btn_select, self.btn_new_line,
+                    self.btn_vertex_edit, self.btn_delete,
                     self.btn_save, self.btn_cancel_edit):
             btn.setEnabled(False)
         idx = self.basemap_combo.currentIndex()
