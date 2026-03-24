@@ -40,13 +40,19 @@ from qgis.core import (
     QgsCoordinateTransform,
     QgsLayerTreeLayer,
     QgsLayerTreeModel,
+    QgsLineSymbol,
     QgsProject,
     QgsRasterLayer,
+    QgsSimpleLineSymbolLayer,
+    QgsSingleSymbolRenderer,
+    QgsVectorLayer,
+    QgsWkbTypes,
 )
 from qgis.gui import (
     QgsLayerTreeMapCanvasBridge,
     QgsLayerTreeView,
     QgsMapCanvas,
+    QgsMapToolPan,
 )
 
 from gdb_reader import (
@@ -68,6 +74,31 @@ BASEMAPS = [
 
 CRS_3857 = QgsCoordinateReferenceSystem("EPSG:3857")
 RASTER_EXTENSIONS = {".tif", ".tiff", ".img", ".ecw", ".jp2", ".vrt"}
+
+# Порядок групп в дереве слоёв (сверху вниз)
+_GEOM_ORDER = {
+    QgsWkbTypes.GeometryType.PointGeometry:   0,
+    QgsWkbTypes.GeometryType.LineGeometry:    1,
+    QgsWkbTypes.GeometryType.PolygonGeometry: 2,
+}
+
+
+def _apply_route_lines_style(layer: QgsVectorLayer):
+    """2 твёрдых линии: нижняя чёрная 2.8pt, верхняя красная 2.8pt"""
+    black = QgsSimpleLineSymbolLayer(QColor(0, 0, 0))
+    black.setWidth(2.8)
+    black.setWidthUnit(QgsSimpleLineSymbolLayer.RenderUnit.RenderPoints)
+
+    red = QgsSimpleLineSymbolLayer(QColor(220, 0, 0))
+    red.setWidth(2.8)
+    red.setWidthUnit(QgsSimpleLineSymbolLayer.RenderUnit.RenderPoints)
+
+    symbol = QgsLineSymbol()
+    symbol.deleteSymbolLayer(0)      # удаляем дефолтный слой
+    symbol.appendSymbolLayer(black)  # нижний
+    symbol.appendSymbolLayer(red)    # верхний
+
+    layer.setRenderer(QgsSingleSymbolRenderer(symbol))
 
 
 class MainWindow(QMainWindow):
@@ -179,13 +210,11 @@ class MainWindow(QMainWindow):
         self.canvas.setCanvasColor(QColor(255, 255, 255))
         self.canvas.enableAntiAliasing(True)
 
-        # Bridge до создания tree view
         self.bridge = QgsLayerTreeMapCanvasBridge(
             self.project.layerTreeRoot(),
             self.canvas
         )
 
-        # QgsLayerTreeModel связывает tree root с view
         self._layer_tree_model = QgsLayerTreeModel(self.project.layerTreeRoot())
         self._layer_tree_model.setFlag(QgsLayerTreeModel.Flag.AllowNodeReorder)
         self._layer_tree_model.setFlag(QgsLayerTreeModel.Flag.AllowNodeRename, False)
@@ -203,6 +232,50 @@ class MainWindow(QMainWindow):
 
         right_layout.addWidget(map_splitter, 1)
 
+        # Инструмент перемещения + зум колесиком
+        self._pan_tool = QgsMapToolPan(self.canvas)
+        self.canvas.setMapTool(self._pan_tool)
+        self.canvas.setWheelFactor(2.0)
+
+    # ------------------------------------------------------------------
+    def _add_layer_ordered(self, layer, visible: bool = True):
+        """Reгистрируем слой без автодобавления в дерево,
+        затем вставляем в правильную позицию в соответствии с типом."""
+        self.project.addMapLayer(layer, False)
+        root = self.project.layerTreeRoot()
+        node = QgsLayerTreeLayer(layer)
+        node.setItemVisibilityChecked(visible)
+
+        is_vector = isinstance(layer, QgsVectorLayer)
+        geom_order = _GEOM_ORDER.get(
+            layer.geometryType() if is_vector else None, 3
+        ) if is_vector else 3  # raster = 3
+
+        # Находим позицию: вставить перед первым слоем с большим или равным порядком
+        children = root.children()
+        insert_pos = len(children)  # по умолчанию в конец
+        for i, child in enumerate(children):
+            if not isinstance(child, QgsLayerTreeLayer):
+                continue
+            child_layer = child.layer()
+            if child_layer is None:
+                continue
+            child_is_vec = isinstance(child_layer, QgsVectorLayer)
+            child_order = _GEOM_ORDER.get(
+                child_layer.geometryType() if child_is_vec else None, 3
+            ) if child_is_vec else 3
+            # подложка (id == _basemap_layer_id) всегда остаётся в конце
+            if child_layer.id() == self._basemap_layer_id:
+                insert_pos = i
+                break
+            if child_order > geom_order:
+                insert_pos = i
+                break
+
+        root.insertChildNode(insert_pos, node)
+        self.preview_layers.append(layer)
+
+    # ------------------------------------------------------------------
     def _switch_basemap(self, index):
         if self._basemap_layer_id is not None:
             self.project.removeMapLayer(self._basemap_layer_id)
@@ -263,19 +336,16 @@ class MainWindow(QMainWindow):
         if path:
             self.raster_edit.setText(path)
 
-    def _load_rasters_from_folder(self, folder_path: str):
+    def _load_rasters_from_folder(self, folder_path: str) -> int:
         folder = Path(folder_path)
         if not folder.exists():
             return 0
         count = 0
-        root = self.project.layerTreeRoot()
         for f in sorted(folder.rglob("*")):
             if f.suffix.lower() in RASTER_EXTENSIONS:
                 layer = QgsRasterLayer(str(f), f.stem, "gdal")
                 if layer.isValid():
-                    self.project.addMapLayer(layer, False)
-                    root.insertChildNode(-1, QgsLayerTreeLayer(layer))
-                    self.preview_layers.append(layer)
+                    self._add_layer_ordered(layer, visible=False)
                     count += 1
         return count
 
@@ -303,57 +373,58 @@ class MainWindow(QMainWindow):
             if not gdb_path:
                 raise RuntimeError("Не задан путь к GDB")
 
-            vector_layers = list_vector_layers(gdb_path)
-            raster_layers = list_raster_layers(gdb_path)
+            vector_names = list_vector_layers(gdb_path)
+            raster_items = list_raster_layers(gdb_path)
 
-            if route_layer_name not in vector_layers:
+            if route_layer_name not in vector_names:
                 raise RuntimeError("Слой %s не найден" % route_layer_name)
 
-            route_layer = load_vector_layer(gdb_path, route_layer_name)
-            self.project.addMapLayer(route_layer)
-            self.preview_layers.append(route_layer)
-
-            if self.config.get("load_all_layers_to_map", True):
-                for name in vector_layers:
+            # Загружаем все векторные слои с автосортировкой
+            route_layer = None
+            for name in vector_names:
+                try:
+                    layer = load_vector_layer(gdb_path, name)
                     if name == route_layer_name:
-                        continue
-                    try:
-                        layer = load_vector_layer(gdb_path, name)
-                        self.project.addMapLayer(layer)
-                        self.preview_layers.append(layer)
-                    except Exception:
-                        pass
-                for item in raster_layers:
-                    try:
-                        layer = load_raster_layer(item["source"], item["name"])
-                        self.project.addMapLayer(layer)
-                        self.preview_layers.append(layer)
-                    except Exception:
-                        pass
+                        _apply_route_lines_style(layer)
+                        route_layer = layer
+                    self._add_layer_ordered(layer, visible=True)
+                except Exception:
+                    pass
 
+            # Растры из GDB (видимы)
+            for item in raster_items:
+                try:
+                    layer = load_raster_layer(item["source"], item["name"])
+                    self._add_layer_ordered(layer, visible=True)
+                except Exception:
+                    pass
+
+            # Растры из папки (сняты с видимости)
             folder_raster_count = 0
             if raster_folder:
                 folder_raster_count = self._load_rasters_from_folder(raster_folder)
+
+            if route_layer is None:
+                raise RuntimeError("Не удалось загрузить %s" % route_layer_name)
 
             self.route_rows = get_route_choices(route_layer, route_name_field)
             for row in self.route_rows:
                 self.route_combo.addItem(row["label"], row["fid"])
 
-            if route_layer.isValid():
-                transform = QgsCoordinateTransform(route_layer.crs(), CRS_3857, self.project)
-                extent_3857 = transform.transformBoundingBox(route_layer.extent())
-                extent_3857.grow(extent_3857.width() * 0.1)
-                self.canvas.setExtent(extent_3857)
-                self.canvas.refresh()
+            transform = QgsCoordinateTransform(route_layer.crs(), CRS_3857, self.project)
+            extent_3857 = transform.transformBoundingBox(route_layer.extent())
+            extent_3857.grow(extent_3857.width() * 0.1)
+            self.canvas.setExtent(extent_3857)
+            self.canvas.refresh()
 
             self.info_label.setText(
                 "Загружено: vectors=%d, rasters_gdb=%d, rasters_folder=%d, routes=%d"
-                % (len(vector_layers), len(raster_layers), folder_raster_count, len(self.route_rows))
+                % (len(vector_names), len(raster_items), folder_raster_count, len(self.route_rows))
             )
             self.report_text.setPlainText(
                 "GDB: %s\nRoute layer: %s\nRoutes: %d\nVectors: %d\nRasters (GDB): %d\nRasters (folder): %d"
                 % (gdb_path, route_layer_name, len(self.route_rows),
-                   len(vector_layers), len(raster_layers), folder_raster_count)
+                   len(vector_names), len(raster_items), folder_raster_count)
             )
 
         except Exception as ex:
