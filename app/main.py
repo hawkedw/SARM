@@ -62,7 +62,6 @@ from qgis.gui import (
     QgsMapCanvas,
     QgsMapToolEdit,
     QgsMapToolPan,
-    QgsMapToolVertexEdit,
     QgsRubberBand,
     QgsMapTool,
 )
@@ -94,7 +93,7 @@ _GEOM_ORDER = {
 }
 
 RENDER_POINTS = QgsUnitTypes.RenderUnit.RenderPoints
-SELECT_TOLERANCE_PX = 8  # пикселей от клика до линии
+SELECT_TOLERANCE_PX = 8
 
 
 def _apply_route_lines_style(layer: QgsVectorLayer):
@@ -112,8 +111,7 @@ def _apply_route_lines_style(layer: QgsVectorLayer):
 
 
 class SelectLineTool(QgsMapTool):
-    """Click — выбрать объект в route_layer в толерансе SELECT_TOLERANCE_PX px."""
-    selectionChanged = pyqtSignal()  # выборка изменилась
+    selectionChanged = pyqtSignal()
 
     def __init__(self, canvas: QgsMapCanvas, route_layer: QgsVectorLayer):
         super().__init__(canvas)
@@ -124,10 +122,8 @@ class SelectLineTool(QgsMapTool):
         if e.button() != Qt.MouseButton.LeftButton:
             return
         pt = self.toMapCoordinates(e.pos())
-        # Переводим tolerance из px в единицы карты
         tol = SELECT_TOLERANCE_PX * self.canvas().mapUnitsPerPixel()
         rect = QgsRectangle(pt.x() - tol, pt.y() - tol, pt.x() + tol, pt.y() + tol)
-        # Преобразуем ректангл из CRS канваса в CRS слоя
         canvas_crs = self.canvas().mapSettings().destinationCrs()
         layer_crs = self._layer.crs()
         if canvas_crs != layer_crs:
@@ -138,11 +134,6 @@ class SelectLineTool(QgsMapTool):
 
 
 class LineDrawTool(QgsMapTool):
-    """
-    Left click  — добавить вершину немедленно.
-    Double click — убрать последнюю вершину (от press) и финишировать.
-    Esc         — отмена.
-    """
     lineFinished = pyqtSignal(list)
 
     def __init__(self, canvas: QgsMapCanvas):
@@ -167,7 +158,6 @@ class LineDrawTool(QgsMapTool):
             self._rb.removeLastPoint()
         if len(self._points) >= 2:
             self._finish()
-        # если < 2 — молча, продолжаем рисовать
 
     def canvasMoveEvent(self, e):
         if not self._points:
@@ -319,7 +309,6 @@ class MainWindow(QMainWindow):
 
         edit_bar = QHBoxLayout()
 
-        # --- Инструменты навигации ---
         self.btn_pan = QPushButton("🖐 Навигация")
         self.btn_pan.setToolTip("Перемещение по карте")
         self.btn_pan.clicked.connect(self._activate_pan)
@@ -330,7 +319,6 @@ class MainWindow(QMainWindow):
         self.btn_select.clicked.connect(self._activate_select)
         self.btn_select.setEnabled(False)
 
-        # --- Инструменты редактирования ---
         self.btn_new_line = QPushButton("⊕ Новая линия")
         self.btn_new_line.setToolTip("Нарисовать новый маршрут")
         self.btn_new_line.clicked.connect(self._start_draw)
@@ -397,7 +385,6 @@ class MainWindow(QMainWindow):
         for btn in (self.btn_pan, self.btn_select, self.btn_new_line,
                     self.btn_save, self.btn_cancel_edit):
             btn.setEnabled(True)
-        # vertex/delete — только после выборки
         self.btn_vertex_edit.setEnabled(False)
         self.btn_delete.setEnabled(False)
 
@@ -434,12 +421,10 @@ class MainWindow(QMainWindow):
         self.btn_vertex_edit.setEnabled(has_sel)
         self.btn_delete.setEnabled(has_sel)
 
-    # ------------------------------------------------------------------
     def _start_draw(self):
         if self._route_layer is None:
             return
-        if self._route_layer:
-            self._route_layer.removeSelection()
+        self._route_layer.removeSelection()
         tool = LineDrawTool(self.canvas)
         tool.lineFinished.connect(self._on_line_finished)
         self._draw_tool = tool
@@ -449,22 +434,18 @@ class MainWindow(QMainWindow):
     def _on_line_finished(self, points: list):
         self.canvas.setMapTool(self._pan_tool)
         self._draw_tool = None
-
         if len(points) < 2:
             self.info_label.setText("Нужно минимум 2 вершины.")
             return
-
         dlg = RouteNameDialog(self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             self.info_label.setText("Создание отменено.")
             return
-
         name = dlg.route_name()
         canvas_crs = self.canvas.mapSettings().destinationCrs()
         layer_crs = self._route_layer.crs()
         transform = QgsCoordinateTransform(canvas_crs, layer_crs, self.project)
         layer_points = [transform.transform(pt) for pt in points]
-
         geom = QgsGeometry.fromPolylineXY(layer_points)
         feat = QgsFeature(self._route_layer.fields())
         feat.setGeometry(geom)
@@ -475,14 +456,11 @@ class MainWindow(QMainWindow):
 
     def _start_vertex_edit(self):
         if self._route_layer is None or self._route_layer.selectedFeatureCount() == 0:
-            self.info_label.setText("Сначала выберите линию (кнопка ‘→ Выборка’).")
+            self.info_label.setText("Сначала выберите линию.")
             return
-        try:
-            tool = QgsMapToolVertexEdit(self.canvas)
-        except AttributeError:
-            tool = QgsMapToolEdit(self.canvas)
+        tool = QgsMapToolEdit(self.canvas)
         self.canvas.setMapTool(tool)
-        self.info_label.setText("Перетащивайте вершины. По завершении нажмите ‘💾 Сохранить’.")
+        self.info_label.setText("Перетащивайте вершины. По завершении — ‘💾 Сохранить’.")
 
     def _delete_selected(self):
         if self._route_layer is None:
@@ -536,12 +514,10 @@ class MainWindow(QMainWindow):
         root = self.project.layerTreeRoot()
         node = QgsLayerTreeLayer(layer)
         node.setItemVisibilityChecked(visible)
-
         is_vector = isinstance(layer, QgsVectorLayer)
         geom_order = _GEOM_ORDER.get(
             layer.geometryType() if is_vector else None, 3
         ) if is_vector else 3
-
         children = root.children()
         insert_pos = len(children)
         for i, child in enumerate(children):
@@ -560,7 +536,6 @@ class MainWindow(QMainWindow):
             if child_order > geom_order:
                 insert_pos = i
                 break
-
         root.insertChildNode(insert_pos, node)
         self.preview_layers.append(layer)
 
@@ -656,21 +631,16 @@ class MainWindow(QMainWindow):
         try:
             self._save_ui_to_config()
             self.clear_project()
-
             gdb_path = self.gdb_edit.text().strip()
             raster_folder = self.raster_edit.text().strip()
             route_layer_name = self.config["route_layer_name"]
             route_name_field = self.config["route_name_field"]
-
             if not gdb_path:
                 raise RuntimeError("Не задан путь к GDB")
-
             vector_names = list_vector_layers(gdb_path)
             raster_items = list_raster_layers(gdb_path)
-
             if route_layer_name not in vector_names:
                 raise RuntimeError("Слой %s не найден" % route_layer_name)
-
             route_layer = None
             for name in vector_names:
                 try:
@@ -681,35 +651,28 @@ class MainWindow(QMainWindow):
                     self._add_layer_ordered(layer, visible=True)
                 except Exception:
                     pass
-
             for item in raster_items:
                 try:
                     layer = load_raster_layer(item["source"], item["name"])
                     self._add_layer_ordered(layer, visible=True)
                 except Exception:
                     pass
-
             folder_raster_count = 0
             if raster_folder:
                 folder_raster_count = self._load_rasters_from_folder(raster_folder)
-
             if route_layer is None:
                 raise RuntimeError("Не удалось загрузить %s" % route_layer_name)
-
             self._route_layer = route_layer
             self._route_layer.startEditing()
             self._enable_edit_toolbar()
-
             self.route_rows = get_route_choices(route_layer, route_name_field)
             for row in self.route_rows:
                 self.route_combo.addItem(row["label"], row["fid"])
-
             transform = QgsCoordinateTransform(route_layer.crs(), CRS_3857, self.project)
             extent_3857 = transform.transformBoundingBox(route_layer.extent())
             extent_3857.grow(extent_3857.width() * 0.1)
             self.canvas.setExtent(extent_3857)
             self.canvas.refresh()
-
             self.info_label.setText(
                 "Загружено: vectors=%d, rasters_gdb=%d, rasters_folder=%d, routes=%d"
                 % (len(vector_names), len(raster_items), folder_raster_count, len(self.route_rows))
@@ -719,7 +682,6 @@ class MainWindow(QMainWindow):
                 % (gdb_path, route_layer_name, len(self.route_rows),
                    len(vector_names), len(raster_items), folder_raster_count)
             )
-
         except Exception as ex:
             self.show_error(ex)
 
@@ -730,14 +692,12 @@ class MainWindow(QMainWindow):
             output_root = self.output_edit.text().strip()
             input_rasters = self.raster_edit.text().strip()
             route_fid = self.route_combo.currentData()
-
             if not gdb_path:
                 raise RuntimeError("Не задан путь к GDB")
             if not output_root:
                 raise RuntimeError("Не задан output folder")
             if route_fid is None:
                 raise RuntimeError("Не выбран маршрут")
-
             result = process_gdb(
                 gdb_path=gdb_path,
                 output_root=output_root,
@@ -748,12 +708,10 @@ class MainWindow(QMainWindow):
                 processing_crs_epsg=self.config.get("processing_crs_epsg"),
                 input_raster_folder=input_rasters or None
             )
-
             manifest = result["manifest"]
             self.report_text.setPlainText(self.format_manifest(manifest))
             self.info_label.setText("Готово. ZIP: %s" % result["zip_path"])
             QMessageBox.information(self, "Готово", "Архив сформирован:\n%s" % result["zip_path"])
-
         except Exception as ex:
             self.show_error(ex)
 
