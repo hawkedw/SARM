@@ -57,8 +57,8 @@ from qgis.gui import (
     QgsLayerTreeView,
     QgsMapCanvas,
     QgsMapToolDigitizeFeature,
+    QgsMapToolEdit,
     QgsMapToolPan,
-    QgsMapToolVertexEdit,
 )
 
 from gdb_reader import (
@@ -105,7 +105,6 @@ def _apply_route_lines_style(layer: QgsVectorLayer):
 
 
 class RouteNameDialog(QDialog):
-    """Простой диалог для ввода названия нового маршрута."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Новый маршрут")
@@ -146,7 +145,6 @@ class MainWindow(QMainWindow):
         self.canvas.setDestinationCrs(CRS_3857)
         QTimer.singleShot(200, lambda: self.basemap_combo.setCurrentIndex(1))
 
-    # ------------------------------------------------------------------
     def _build_ui(self):
         root = QWidget()
         self.setCentralWidget(root)
@@ -164,7 +162,6 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(4, 4, 4, 4)
         root_layout.addWidget(main_splitter)
 
-        # --- Левая панель ---
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 4, 0)
 
@@ -214,11 +211,9 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.info_label)
         left_layout.addWidget(self.report_text, 1)
 
-        # --- Правая панель ---
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Строка: подложка
         basemap_row = QHBoxLayout()
         basemap_row.addWidget(QLabel("Подложка:"))
         self.basemap_combo = QComboBox()
@@ -233,6 +228,7 @@ class MainWindow(QMainWindow):
         edit_bar = QHBoxLayout()
         self.btn_edit_toggle = QPushButton("✒ Редактировать")
         self.btn_edit_toggle.setCheckable(True)
+        self.btn_edit_toggle.setEnabled(False)
         self.btn_edit_toggle.clicked.connect(self._toggle_edit)
         self.btn_new_line = QPushButton("⊕ Новая линия")
         self.btn_new_line.clicked.connect(self._start_digitize)
@@ -258,7 +254,6 @@ class MainWindow(QMainWindow):
         edit_bar.addWidget(self.btn_cancel)
         right_layout.addLayout(edit_bar)
 
-        # Канвас + дерево слоёв
         map_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.canvas = QgsMapCanvas()
         self.canvas.setCanvasColor(QColor(255, 255, 255))
@@ -302,7 +297,6 @@ class MainWindow(QMainWindow):
                         self.btn_save, self.btn_cancel):
                 btn.setEnabled(True)
         else:
-            # Если есть несохранённые изменения — спросить
             if self._route_layer.isModified():
                 reply = QMessageBox.question(
                     self, "Сохранить?",
@@ -347,11 +341,12 @@ class MainWindow(QMainWindow):
         self.info_label.setText("Линия «%s» добавлена. Не забудьте сохранить." % name)
 
     def _start_vertex_edit(self):
+        """QgsMapToolEdit — перетаскивание вершин при активном режиме редактирования слоя."""
         if self._route_layer is None:
             return
-        tool = QgsMapToolVertexEdit(self.canvas)
+        tool = QgsMapToolEdit(self.canvas)
         self.canvas.setMapTool(tool)
-        self.info_label.setText("Кликните на линию для редактирования вершин.")
+        self.info_label.setText("Кликните на линию и перетащивайте вершины.")
 
     def _delete_selected(self):
         if self._route_layer is None:
@@ -390,7 +385,6 @@ class MainWindow(QMainWindow):
         )
         for row in self.route_rows:
             self.route_combo.addItem(row["label"], row["fid"])
-        # восстановить выбор если fid ещё есть
         for i in range(self.route_combo.count()):
             if self.route_combo.itemData(i) == current_fid:
                 self.route_combo.setCurrentIndex(i)
