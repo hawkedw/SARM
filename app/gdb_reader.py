@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import List
 
 from osgeo import ogr, gdal
@@ -14,13 +15,11 @@ def list_vector_layers(gdb_path: str) -> List[str]:
     ds = drv.Open(gdb_path, 0) if drv else ogr.Open(gdb_path)
     if ds is None:
         raise RuntimeError("Не удалось открыть GDB: %s" % gdb_path)
-
     names = []
     for i in range(ds.GetLayerCount()):
         layer = ds.GetLayerByIndex(i)
         if layer is not None:
             names.append(layer.GetName())
-
     return names
 
 
@@ -32,10 +31,8 @@ def list_raster_layers(gdb_path: str) -> List[dict]:
             ds = gdal.OpenEx(gdb_path, gdal.OF_RASTER, allowed_drivers=["OpenFileGDB"])
         else:
             ds = gdal.OpenEx(gdb_path, gdal.OF_RASTER)
-
         if ds is None:
             return []
-
         subdatasets = ds.GetSubDatasets()
         result = []
         for source, _desc in subdatasets:
@@ -65,10 +62,8 @@ def get_route_choices(route_layer, name_field: str) -> List[dict]:
     field_idx = route_layer.fields().indexFromName(name_field)
     if field_idx == -1:
         raise RuntimeError("В слое %s нет поля %s" % (route_layer.name(), name_field))
-
     request = QgsFeatureRequest().setSubsetOfAttributes([field_idx])
     rows = []
-
     for feature in route_layer.getFeatures(request):
         name_value = feature[name_field]
         name_text = str(name_value).strip() if name_value is not None else ""
@@ -78,6 +73,5 @@ def get_route_choices(route_layer, name_field: str) -> List[dict]:
             "name": name_text,
             "label": "%s [FID=%d]" % (label, feature.id())
         })
-
     rows.sort(key=lambda x: (x["name"].lower(), x["fid"]))
     return rows

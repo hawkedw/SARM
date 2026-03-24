@@ -42,7 +42,11 @@ from qgis.core import (
     QgsProject,
     QgsRasterLayer,
 )
-from qgis.gui import QgsLayerTreeMapCanvasBridge, QgsMapCanvas
+from qgis.gui import (
+    QgsLayerTreeMapCanvasBridge,
+    QgsLayerTreeView,
+    QgsMapCanvas,
+)
 
 from gdb_reader import (
     get_route_choices,
@@ -62,6 +66,7 @@ BASEMAPS = [
 ]
 
 CRS_3857 = QgsCoordinateReferenceSystem("EPSG:3857")
+RASTER_EXTENSIONS = {".tif", ".tiff", ".img", ".ecw", ".jp2", ".vrt"}
 
 
 class MainWindow(QMainWindow):
@@ -73,7 +78,7 @@ class MainWindow(QMainWindow):
         self.project.setCrs(CRS_3857)
 
         self.setWindowTitle("Topo Cutter MVP")
-        self.resize(1500, 900)
+        self.resize(1600, 900)
 
         self.route_rows = []
         self.preview_layers = []
@@ -89,34 +94,41 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
 
-        splitter = QSplitter()
+        # Главный сплиттер: левая панель + правая
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
         left = QWidget()
         right = QWidget()
-        splitter.addWidget(left)
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
+        main_splitter.addWidget(left)
+        main_splitter.addWidget(right)
+        main_splitter.setStretchFactor(0, 0)
+        main_splitter.setStretchFactor(1, 1)
+        main_splitter.setSizes([320, 1280])
 
         root_layout = QHBoxLayout(root)
-        root_layout.addWidget(splitter)
+        root_layout.setContentsMargins(4, 4, 4, 4)
+        root_layout.addWidget(main_splitter)
 
+        # --- Левая панель: форма + кнопки + лог ---
         left_layout = QVBoxLayout(left)
-        right_layout = QVBoxLayout(right)
+        left_layout.setContentsMargins(0, 0, 4, 0)
 
         form = QFormLayout()
 
         self.gdb_edit = QLineEdit()
         gdb_btn = QPushButton("...")
+        gdb_btn.setFixedWidth(28)
         gdb_btn.clicked.connect(self.choose_gdb)
         form.addRow("Input GDB", self._with_button(self.gdb_edit, gdb_btn))
 
         self.output_edit = QLineEdit()
         out_btn = QPushButton("...")
+        out_btn.setFixedWidth(28)
         out_btn.clicked.connect(self.choose_output)
         form.addRow("Output folder", self._with_button(self.output_edit, out_btn))
 
         self.raster_edit = QLineEdit()
         raster_btn = QPushButton("...")
+        raster_btn.setFixedWidth(28)
         raster_btn.clicked.connect(self.choose_raster_folder)
         form.addRow("Raster folder", self._with_button(self.raster_edit, raster_btn))
 
@@ -149,6 +161,10 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.info_label)
         left_layout.addWidget(self.report_text, 1)
 
+        # --- Правая панель: верхняя строка (basemap) + верт. сплиттер (tree + canvas) ---
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
         basemap_row = QHBoxLayout()
         basemap_row.addWidget(QLabel("Подложка:"))
         self.basemap_combo = QComboBox()
@@ -157,18 +173,35 @@ class MainWindow(QMainWindow):
         self.basemap_combo.currentIndexChanged.connect(self._switch_basemap)
         basemap_row.addWidget(self.basemap_combo)
         basemap_row.addStretch()
+        right_layout.addLayout(basemap_row)
+
+        # Сплиттер: список слоёв | канвас
+        map_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        self.layer_tree_view = QgsLayerTreeView()
+        self.layer_tree_view.setMinimumWidth(180)
 
         self.canvas = QgsMapCanvas()
         self.canvas.setCanvasColor(QColor(255, 255, 255))
         self.canvas.enableAntiAliasing(True)
 
+        map_splitter.addWidget(self.layer_tree_view)
+        map_splitter.addWidget(self.canvas)
+        map_splitter.setStretchFactor(0, 0)
+        map_splitter.setStretchFactor(1, 1)
+        map_splitter.setSizes([220, 1060])
+
+        right_layout.addWidget(map_splitter, 1)
+
+        # Bridge связывает дерево слоёв с канвасом
         self.bridge = QgsLayerTreeMapCanvasBridge(
             self.project.layerTreeRoot(),
             self.canvas
         )
-
-        right_layout.addLayout(basemap_row)
-        right_layout.addWidget(self.canvas)
+        # Подключаем tree view к модели проекта
+        self.layer_tree_view.setModel(
+            self.project.layerTreeRoot().createModel()
+        )
 
     def _switch_basemap(self, index):
         if self._basemap_layer_id is not None:
@@ -226,9 +259,25 @@ class MainWindow(QMainWindow):
             self.output_edit.setText(path)
 
     def choose_raster_folder(self):
-        path = QFileDialog.getExistingDirectory(self, "Выбери папку с TIFF")
+        path = QFileDialog.getExistingDirectory(self, "Выбери папку с растрами")
         if path:
             self.raster_edit.setText(path)
+
+    def _load_rasters_from_folder(self, folder_path: str):
+        folder = Path(folder_path)
+        if not folder.exists():
+            return 0
+        count = 0
+        for f in sorted(folder.rglob("*")):
+            if f.suffix.lower() in RASTER_EXTENSIONS:
+                layer = QgsRasterLayer(str(f), f.stem, "gdal")
+                if layer.isValid():
+                    self.project.addMapLayer(layer, False)
+                    root = self.project.layerTreeRoot()
+                    root.insertChildNode(-1, QgsLayerTreeLayer(layer))
+                    self.preview_layers.append(layer)
+                    count += 1
+        return count
 
     def clear_project(self):
         self.project.removeAllMapLayers()
@@ -247,6 +296,7 @@ class MainWindow(QMainWindow):
             self.clear_project()
 
             gdb_path = self.gdb_edit.text().strip()
+            raster_folder = self.raster_edit.text().strip()
             route_layer_name = self.config["route_layer_name"]
             route_name_field = self.config["route_name_field"]
 
@@ -281,6 +331,11 @@ class MainWindow(QMainWindow):
                     except Exception:
                         pass
 
+            # Растры из папки
+            folder_raster_count = 0
+            if raster_folder:
+                folder_raster_count = self._load_rasters_from_folder(raster_folder)
+
             self.route_rows = get_route_choices(route_layer, route_name_field)
             for row in self.route_rows:
                 self.route_combo.addItem(row["label"], row["fid"])
@@ -293,12 +348,13 @@ class MainWindow(QMainWindow):
                 self.canvas.refresh()
 
             self.info_label.setText(
-                "Загружено: vectors=%d, rasters=%d, routes=%d"
-                % (len(vector_layers), len(raster_layers), len(self.route_rows))
+                "Загружено: vectors=%d, rasters_gdb=%d, rasters_folder=%d, routes=%d"
+                % (len(vector_layers), len(raster_layers), folder_raster_count, len(self.route_rows))
             )
             self.report_text.setPlainText(
-                "GDB loaded\nRoute layer: %s\nAvailable routes: %d\nVector layers: %d\nRaster layers: %d"
-                % (route_layer_name, len(self.route_rows), len(vector_layers), len(raster_layers))
+                "GDB: %s\nRoute layer: %s\nRoutes: %d\nVectors: %d\nRasters (GDB): %d\nRasters (folder): %d"
+                % (gdb_path, route_layer_name, len(self.route_rows),
+                   len(vector_layers), len(raster_layers), folder_raster_count)
             )
 
         except Exception as ex:
