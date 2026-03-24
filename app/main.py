@@ -10,11 +10,11 @@ ROOT_DIR = APP_DIR.parent
 CONFIG_PATH = ROOT_DIR / "config.json"
 
 config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-bootstrap_qgis(config["qgis_prefix_path"])
+bootstrap_qgis()
 
 from qgis_runtime import init_qgis, init_processing, shutdown_qgis
 
-QGS_APP = init_qgis(config["qgis_prefix_path"], gui_enabled=True)
+QGS_APP = init_qgis(gui_enabled=True)
 init_processing()
 
 from qgis.PyQt.QtCore import Qt, QTimer
@@ -37,6 +37,7 @@ from qgis.PyQt.QtWidgets import (
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
+    QgsLayerTreeLayer,
     QgsProject,
     QgsRasterLayer,
 )
@@ -81,8 +82,6 @@ class MainWindow(QMainWindow):
         self._load_config_into_ui()
 
         self.canvas.setDestinationCrs(CRS_3857)
-
-        # Инициализация подложки после запуска event loop
         QTimer.singleShot(200, lambda: self.basemap_combo.setCurrentIndex(1))
 
     def _build_ui(self):
@@ -149,7 +148,6 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.info_label)
         left_layout.addWidget(self.report_text, 1)
 
-        # --- Basemap switcher ---
         basemap_row = QHBoxLayout()
         basemap_row.addWidget(QLabel("Подложка:"))
         self.basemap_combo = QComboBox()
@@ -186,15 +184,10 @@ class MainWindow(QMainWindow):
             self.info_label.setText("Не удалось загрузить подложку: %s" % bm["name"])
             return
 
-        # addMapLayer(layer, False) — не добавлять в дерево автоматически
         self.project.addMapLayer(layer, False)
         self._basemap_layer_id = layer.id()
-
-        # Вставляем в самый низ дерева слоёв
         root = self.project.layerTreeRoot()
-        from qgis.core import QgsLayerTreeLayer
         root.insertChildNode(-1, QgsLayerTreeLayer(layer))
-
         self.canvas.refresh()
 
     def _with_button(self, line_edit, button):
